@@ -1,0 +1,39 @@
+name: Release Plugin
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Derive release version
+        run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build plugin jar
+        run: ./scripts/gradle.sh --no-daemon :plugin-vocabulary-quest:clean :plugin-vocabulary-quest:jar -PreleaseVersion="${RELEASE_VERSION}"
+
+      - name: Verify release artifact
+        run: ls -la "plugin-vocabulary-quest/build/libs/vocabulary-quest-plugin-${RELEASE_VERSION}.jar"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            plugin-vocabulary-quest/build/libs/vocabulary-quest-plugin-${{ env.RELEASE_VERSION }}.jar

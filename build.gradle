@@ -1,6 +1,6 @@
 allprojects {
-    group = 'dev.snpr.mincraft'
-    version = '0.1.0-SNAPSHOT'
+    group = 'io.github.stuttgartnerd.vocabularyquest'
+    version = findProperty('releaseVersion') ?: '0.1.0-SNAPSHOT'
 
     repositories {
         mavenCentral()
