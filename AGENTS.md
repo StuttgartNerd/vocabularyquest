@@ -88,6 +88,7 @@ Used for:
 - Daily default limit comes from `playtime.default_daily_limit_minutes`.
 - Effective limit is either default limit or per-player override set via `/playtime setlimit`.
 - Daily usage increments once per minute for online players.
+- In the final 5 minutes, each player receives one per-minute Jenkins chat warning countdown (`5` to `1`).
 - Limit is enforced on login and during runtime; player is kicked when `used >= limit`.
 - Daily usage resets automatically when calendar date changes.
 - Kick message template comes from `playtime.kick_message` and supports `{used}` / `{limit}` placeholders.

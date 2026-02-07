@@ -12,6 +12,7 @@ Plugin name: `VocabularyQuestPlugin`
 ## For Players
 - `/answer <antwort>`: answer the currently active vocabulary quest.
 - `/msg jenkins <antwort>`: alternate way to answer in private chat.
+- Jenkins sends one warning per minute in the last 5 minutes before daily playtime runs out.
 - Daily playtime limits may disconnect players when their daily limit is reached.
 
 ## For Admins (RCON Only)

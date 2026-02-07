@@ -60,6 +60,7 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
     private static final int DEFAULT_HTTP_CONNECT_TIMEOUT_SECONDS = 10;
     private static final int DEFAULT_HTTP_READ_TIMEOUT_SECONDS = 20;
     private static final int DEFAULT_PLAYTIME_DAILY_LIMIT_MINUTES = 120;
+    private static final int PLAYTIME_WARNING_WINDOW_MINUTES = 5;
     private static final String DEFAULT_PLAYTIME_KICK_MESSAGE = "Daily playtime limit reached ({used}/{limit} min). "
             + "Come back tomorrow.";
 
@@ -866,6 +867,10 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
             try {
                 SQLiteStore.PlayerPlaytime updated =
                         sqliteStore.addDailyUsedMinutesForToday(username, 1, todayDate, defaultLimit);
+                int remainingMinutes = updated.effectiveLimitMinutes() - updated.dailyUsedMinutes();
+                if (remainingMinutes > 0 && remainingMinutes <= PLAYTIME_WARNING_WINDOW_MINUTES) {
+                    sendPlaytimeWarning(player, remainingMinutes);
+                }
                 if (updated.dailyUsedMinutes() >= updated.effectiveLimitMinutes()) {
                     player.kickPlayer(buildPlaytimeKickMessage(updated.dailyUsedMinutes(), updated.effectiveLimitMinutes()));
                 }
@@ -1044,6 +1049,12 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
 
     private void broadcastAsJenkins(String message) {
         Bukkit.broadcast(Component.text("<" + PLUGIN_CHAT_NAME + "> " + message));
+    }
+
+    private void sendPlaytimeWarning(Player player, int remainingMinutes) {
+        String minuteLabel = remainingMinutes == 1 ? "minute" : "minutes";
+        String message = "Playtime warning: " + remainingMinutes + " " + minuteLabel + " remaining today.";
+        player.sendMessage(Component.text("<" + PLUGIN_CHAT_NAME + "> " + message));
     }
 
     private boolean isRconSender(CommandSender sender) {

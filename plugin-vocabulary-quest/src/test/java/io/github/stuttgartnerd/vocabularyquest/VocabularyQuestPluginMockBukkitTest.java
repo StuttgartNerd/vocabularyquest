@@ -437,6 +437,35 @@ class VocabularyQuestPluginMockBukkitTest {
         assertEquals(120, normal.effectiveLimitMinutes());
     }
 
+    @Test
+    void playtimeWarningsCountDownFromFiveMinutes() throws Exception {
+        SQLiteStore store = getSQLiteStore();
+        PlayerMock player = server.addPlayer("WarnUser");
+        String today = LocalDate.now().toString();
+
+        store.setLimitOverrideMinutesForToday("WarnUser", 10, today, 120);
+        store.setDailyUsedMinutesForToday("WarnUser", 4, today, 120);
+
+        for (int i = 0; i < 5; i++) {
+            invokeTrackOnlinePlaytimeUsage();
+        }
+
+        List<String> messages = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            String next = player.nextMessage();
+            if (next == null) {
+                break;
+            }
+            messages.add(next);
+        }
+
+        assertTrue(messages.stream().anyMatch(m -> m.contains("<Jenkins> Playtime warning: 5 minutes remaining today.")));
+        assertTrue(messages.stream().anyMatch(m -> m.contains("<Jenkins> Playtime warning: 4 minutes remaining today.")));
+        assertTrue(messages.stream().anyMatch(m -> m.contains("<Jenkins> Playtime warning: 3 minutes remaining today.")));
+        assertTrue(messages.stream().anyMatch(m -> m.contains("<Jenkins> Playtime warning: 2 minutes remaining today.")));
+        assertTrue(messages.stream().anyMatch(m -> m.contains("<Jenkins> Playtime warning: 1 minute remaining today.")));
+    }
+
     private RemoteConsoleCommandSender createRconSender(List<String> sink) {
         return (RemoteConsoleCommandSender) Proxy.newProxyInstance(
                 RemoteConsoleCommandSender.class.getClassLoader(),
@@ -505,6 +534,12 @@ class VocabularyQuestPluginMockBukkitTest {
 
     private void invokeImportConfiguredSheetsOnStartup() throws Exception {
         Method method = VocabularyQuestPlugin.class.getDeclaredMethod("importConfiguredSheetsOnStartup");
+        method.setAccessible(true);
+        method.invoke(plugin);
+    }
+
+    private void invokeTrackOnlinePlaytimeUsage() throws Exception {
+        Method method = VocabularyQuestPlugin.class.getDeclaredMethod("trackOnlinePlaytimeUsage");
         method.setAccessible(true);
         method.invoke(plugin);
     }
