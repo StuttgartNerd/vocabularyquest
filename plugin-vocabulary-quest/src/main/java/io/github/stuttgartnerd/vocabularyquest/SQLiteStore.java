@@ -173,6 +173,47 @@ final class SQLiteStore implements AutoCloseable {
         }
     }
 
+    synchronized int totalVocabularyEntries() throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("""
+                SELECT
+                    (SELECT COUNT(*) FROM vocab_de_en)
+                    +
+                    (SELECT COUNT(*) FROM vocab_de_fr) AS total
+                """);
+             ResultSet resultSet = statement.executeQuery()) {
+            return resultSet.next() ? resultSet.getInt("total") : 0;
+        }
+    }
+
+    synchronized int clearVocabularyLanguageAndTracking(String language) throws SQLException {
+        String normalizedLang = language == null ? "" : language.trim().toLowerCase();
+        String table;
+
+        if ("en".equals(normalizedLang)) {
+            table = "vocab_de_en";
+        } else if ("fr".equals(normalizedLang)) {
+            table = "vocab_de_fr";
+        } else {
+            throw new SQLException("Unsupported language for vocabulary clear: " + language);
+        }
+
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+
+        try (Statement statement = connection.createStatement()) {
+            int removed = statement.executeUpdate("DELETE FROM " + table);
+            statement.executeUpdate("DELETE FROM player_vocab_rewards");
+            statement.executeUpdate("DELETE FROM vocab_attempts");
+            connection.commit();
+            return removed;
+        } catch (SQLException e) {
+            connection.rollback();
+            throw e;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
     synchronized QuestEntry selectWeightedQuestForOnlinePlayers(List<String> onlinePlayers, Random random)
             throws SQLException {
         if (onlinePlayers == null || onlinePlayers.isEmpty()) {

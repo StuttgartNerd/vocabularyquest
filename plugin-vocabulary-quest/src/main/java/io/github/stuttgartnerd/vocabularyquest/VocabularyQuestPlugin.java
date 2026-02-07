@@ -35,12 +35,14 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
     private static final String PLUGIN_CHAT_NAME = "Jenkins";
     private static final String DB_DUMP_COMMAND = "dbdump";
     private static final String FLUSH_ANSWERS_COMMAND = "flushanswers";
+    private static final String FLUSH_VOCAB_COMMAND = "flushvocab";
     private static final String ADD_VOCAB_COMMAND = "addvocab";
     private static final String ANSWER_COMMAND = "answer";
     private static final String QUEST_NOW_COMMAND = "questnow";
     private static final long QUEST_TIMEOUT_TICKS = 2L * 60L * 20L;
     private static final int QUEST_DELAY_MIN_SECONDS = 3 * 60;
     private static final int QUEST_DELAY_MAX_SECONDS = 10 * 60;
+    private static final int MIN_VOCAB_ENTRIES_FOR_TIMER_QUESTS = 10;
     private static final int MAX_ANSWER_LENGTH = 64;
     private static final int MAX_VOCAB_TERM_LENGTH = 64;
 
@@ -124,6 +126,36 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
             } catch (SQLException e) {
                 getLogger().log(Level.SEVERE, "Failed to clear answer tracking tables.", e);
                 sender.sendMessage("Failed to clear answer tracking tables.");
+            }
+            return true;
+        }
+
+        if (FLUSH_VOCAB_COMMAND.equalsIgnoreCase(command.getName())) {
+            if (!isRconSender(sender)) {
+                sender.sendMessage("This command is restricted to RCON.");
+                return true;
+            }
+
+            if (args.length != 1) {
+                sender.sendMessage("Usage: /flushvocab <en|fr>");
+                return true;
+            }
+
+            String language = sanitizeUserInput(args[0]).toLowerCase(Locale.ROOT);
+            if (!"en".equals(language) && !"fr".equals(language)) {
+                sender.sendMessage("Language must be en or fr.");
+                return true;
+            }
+
+            try {
+                int removedEntries = sqliteStore.clearVocabularyLanguageAndTracking(language);
+                sender.sendMessage("Cleared de_" + language + " (" + removedEntries
+                        + " entries) and reset reward/attempt tracking tables.");
+                getLogger().info("RCON cleared de_" + language + " (" + removedEntries
+                        + " entries) and reset reward/attempt tracking tables.");
+            } catch (SQLException e) {
+                getLogger().log(Level.SEVERE, "Failed to clear de_" + language + " vocabulary table.", e);
+                sender.sendMessage("Failed to clear de_" + language + " vocabulary table.");
             }
             return true;
         }
@@ -391,7 +423,16 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
     }
 
     private boolean startVocabularyQuest() {
+        return startVocabularyQuest(false);
+    }
+
+    private boolean startVocabularyQuest(boolean timerTriggered) {
         if (activeQuest != null || sqliteStore == null) {
+            return false;
+        }
+
+        if (timerTriggered && !hasMinimumVocabularyForTimerQuests()) {
+            scheduleNextQuest();
             return false;
         }
 
@@ -441,6 +482,22 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
         return true;
     }
 
+    private boolean hasMinimumVocabularyForTimerQuests() {
+        try {
+            int totalEntries = sqliteStore.totalVocabularyEntries();
+            if (totalEntries < MIN_VOCAB_ENTRIES_FOR_TIMER_QUESTS) {
+                getLogger().info("Skipping timed quest start because only " + totalEntries
+                        + " vocabulary entries are available (minimum "
+                        + MIN_VOCAB_ENTRIES_FOR_TIMER_QUESTS + ").");
+                return false;
+            }
+            return true;
+        } catch (SQLException e) {
+            getLogger().log(Level.SEVERE, "Failed to count vocabulary entries for timed quest gating.", e);
+            return false;
+        }
+    }
+
     private void onQuestTimeout(ActiveQuest expectedQuest) {
         if (activeQuest == null || expectedQuest == null) {
             return;
@@ -470,7 +527,7 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
 
         scheduledQuestTask = Bukkit.getScheduler().runTaskLater(this, () -> {
             scheduledQuestTask = null;
-            startVocabularyQuest();
+            startVocabularyQuest(true);
         }, delayTicks);
 
         getLogger().info("Scheduled next vocabulary quest in " + delaySeconds + " seconds.");

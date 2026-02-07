@@ -65,15 +65,16 @@ Plugin-originated broadcasts are emitted with chat identity `Jenkins`.
 
 ## Plugin Commands
 
-Player/console commands:
+Player commands:
 
-- `/questnow` - starts quest immediately
 - `/answer <antwort>` - answer active quest
 
 RCON-only admin commands:
 
+- `/questnow` - starts quest immediately
 - `/dbdump` - dumps users/vocabulary/rewards/attempts to server log
 - `/flushanswers` - clears reward/attempt tracking tables
+- `/flushvocab <en|fr>` - clears one vocabulary table (`de_en` or `de_fr`) and resets reward/attempt tracking
 - `/addvocab <en|fr> <de_wort> <uebersetzung>` - inserts one vocabulary row
 
 ## Vocabulary CSV Files
@@ -112,6 +113,7 @@ Send commands:
 ```bash
 python3 ./scripts/rcon-command.py --host 127.0.0.1 --port 25575 --password dev-rcon-password "questnow"
 python3 ./scripts/rcon-command.py --host 127.0.0.1 --port 25575 --password dev-rcon-password "flushanswers"
+python3 ./scripts/rcon-command.py --host 127.0.0.1 --port 25575 --password dev-rcon-password "flushvocab en"
 python3 ./scripts/rcon-command.py --host 127.0.0.1 --port 25575 --password dev-rcon-password "addvocab en hund dog"
 ```
 

@@ -100,6 +100,56 @@ class SQLiteStoreTest {
     }
 
     @Test
+    void reportsTotalVocabularyEntriesAcrossLanguages() throws Exception {
+        Path db = tempDir.resolve("total-vocab.db");
+
+        try (SQLiteStore store = new SQLiteStore(db)) {
+            store.initializeSchema();
+            store.replaceDeEn(List.of(
+                    new SQLiteStore.VocabEntry("haus", "house"),
+                    new SQLiteStore.VocabEntry("baum", "tree")
+            ));
+            store.replaceDeFr(List.of(
+                    new SQLiteStore.VocabEntry("maus", "souris")
+            ));
+
+            assertEquals(3, store.totalVocabularyEntries());
+        }
+    }
+
+    @Test
+    void clearsSelectedVocabularyLanguageAndTracking() throws Exception {
+        Path db = tempDir.resolve("clear-language.db");
+
+        try (SQLiteStore store = new SQLiteStore(db)) {
+            store.initializeSchema();
+            store.replaceDeEn(List.of(
+                    new SQLiteStore.VocabEntry("haus", "house"),
+                    new SQLiteStore.VocabEntry("baum", "tree")
+            ));
+            store.replaceDeFr(List.of(
+                    new SQLiteStore.VocabEntry("maus", "souris")
+            ));
+
+            store.recordAttempt("alice", "de_en", "haus", false);
+            store.recordAttempt("alice", "de_fr", "maus", false);
+            assertTrue(store.claimReward("alice", "de_en", "haus"));
+            assertTrue(store.claimReward("alice", "de_fr", "maus"));
+
+            int removed = store.clearVocabularyLanguageAndTracking("en");
+            assertEquals(2, removed);
+
+            SQLiteStore.DumpSummary summary = store.dumpToLog(TEST_LOGGER);
+            assertEquals(0, summary.deEnEntries());
+            assertEquals(1, summary.deFrEntries());
+            assertEquals(0, summary.rewards());
+            assertEquals(0, summary.attempts());
+
+            assertThrows(SQLException.class, () -> store.clearVocabularyLanguageAndTracking("it"));
+        }
+    }
+
+    @Test
     void selectsQuestOnlyForRewardEligibleOnlinePlayers() throws Exception {
         Path db = tempDir.resolve("online-eligibility.db");
 

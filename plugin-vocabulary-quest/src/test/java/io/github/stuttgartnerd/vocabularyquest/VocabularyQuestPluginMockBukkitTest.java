@@ -14,6 +14,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
@@ -51,6 +52,9 @@ class VocabularyQuestPluginMockBukkitTest {
         CommandResult playerResult = server.executePlayer("flushanswers");
         playerResult.assertResponse("This command is restricted to RCON.");
 
+        CommandResult playerFlushVocabResult = server.executePlayer("flushvocab", "en");
+        playerFlushVocabResult.assertResponse("This command is restricted to RCON.");
+
         CommandResult playerQuestResult = server.executePlayer("questnow");
         playerQuestResult.assertResponse("This command is restricted to RCON.");
 
@@ -59,6 +63,9 @@ class VocabularyQuestPluginMockBukkitTest {
 
         CommandResult consoleResult = server.executeConsole("addvocab", "en", "hund", "dog");
         consoleResult.assertResponse("This command is restricted to RCON.");
+
+        CommandResult consoleFlushVocabResult = server.executeConsole("flushvocab", "en");
+        consoleFlushVocabResult.assertResponse("This command is restricted to RCON.");
 
         CommandResult consoleQuestResult = server.executeConsole("questnow");
         consoleQuestResult.assertResponse("This command is restricted to RCON.");
@@ -144,6 +151,61 @@ class VocabularyQuestPluginMockBukkitTest {
 
         assertNull(getActiveQuest());
         assertEquals(emeraldsBefore + 1, countMaterial(player, Material.EMERALD));
+    }
+
+    @Test
+    void timedQuestRequiresAtLeastTenEntriesButQuestNowCanStillStart() throws Exception {
+        server.addPlayer("ThresholdUser");
+        SQLiteStore store = getSQLiteStore();
+        store.replaceDeEn(List.of(
+                new SQLiteStore.VocabEntry("haus", "house"),
+                new SQLiteStore.VocabEntry("baum", "tree")
+        ));
+        store.replaceDeFr(List.of(
+                new SQLiteStore.VocabEntry("maus", "souris"),
+                new SQLiteStore.VocabEntry("wasser", "eau")
+        ));
+
+        assertFalse(invokeStartVocabularyQuest(true));
+        assertNull(getActiveQuest());
+
+        List<String> rconMessages = new ArrayList<>();
+        RemoteConsoleCommandSender rcon = createRconSender(rconMessages);
+        PluginCommand questNow = server.getPluginCommand("questnow");
+        assertNotNull(questNow);
+        assertTrue(plugin.onCommand(rcon, questNow, "questnow", new String[0]));
+
+        assertTrue(rconMessages.stream().anyMatch(m -> m.contains("Vokabel-Quest wurde gestartet.")));
+        assertNotNull(getActiveQuest());
+    }
+
+    @Test
+    void flushVocabClearsSelectedLanguageAndTracking() throws Exception {
+        SQLiteStore store = getSQLiteStore();
+        store.replaceDeEn(List.of(
+                new SQLiteStore.VocabEntry("haus", "house"),
+                new SQLiteStore.VocabEntry("baum", "tree")
+        ));
+        store.replaceDeFr(List.of(
+                new SQLiteStore.VocabEntry("maus", "souris")
+        ));
+        store.recordAttempt("alice", "de_en", "haus", false);
+        store.recordAttempt("alice", "de_fr", "maus", false);
+        assertTrue(store.claimReward("alice", "de_en", "haus"));
+        assertTrue(store.claimReward("alice", "de_fr", "maus"));
+
+        List<String> rconMessages = new ArrayList<>();
+        RemoteConsoleCommandSender rcon = createRconSender(rconMessages);
+        PluginCommand flushVocab = server.getPluginCommand("flushvocab");
+        assertNotNull(flushVocab);
+        assertTrue(plugin.onCommand(rcon, flushVocab, "flushvocab", new String[]{"en"}));
+
+        SQLiteStore.DumpSummary after = store.dumpToLog(java.util.logging.Logger.getLogger("test"));
+        assertEquals(0, after.deEnEntries());
+        assertEquals(1, after.deFrEntries());
+        assertEquals(0, after.rewards());
+        assertEquals(0, after.attempts());
+        assertTrue(rconMessages.stream().anyMatch(m -> m.contains("Cleared de_en (2 entries)")));
     }
 
     @Test
@@ -246,6 +308,12 @@ class VocabularyQuestPluginMockBukkitTest {
     private String getQuestAnswer(Object activeQuest) throws Exception {
         Object answer = activeQuest.getClass().getDeclaredMethod("answer").invoke(activeQuest);
         return String.valueOf(answer).toLowerCase(Locale.ROOT);
+    }
+
+    private boolean invokeStartVocabularyQuest(boolean timerTriggered) throws Exception {
+        Method method = VocabularyQuestPlugin.class.getDeclaredMethod("startVocabularyQuest", boolean.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(plugin, timerTriggered);
     }
 
     private int countMaterial(PlayerMock player, Material material) {

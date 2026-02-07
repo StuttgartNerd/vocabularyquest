@@ -17,6 +17,9 @@ commands:
   flushanswers:
     description: RCON only, clears reward and attempt tracking tables
     usage: /flushanswers
+  flushvocab:
+    description: RCON only, clears one vocabulary language table and resets reward/attempt tracking
+    usage: /flushvocab <en|fr>
   addvocab:
     description: RCON only, inserts a de-en or de-fr vocabulary pair
     usage: /addvocab <en|fr> <de_wort> <uebersetzung>
