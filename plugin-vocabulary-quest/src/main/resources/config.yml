@@ -5,3 +5,8 @@ vocab_import:
   http:
     connect_timeout_seconds: 10
     read_timeout_seconds: 20
+
+playtime:
+  enabled: true
+  default_daily_limit_minutes: 120
+  kick_message: "Daily playtime limit reached ({used}/{limit} min). Come back tomorrow."

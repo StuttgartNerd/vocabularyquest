@@ -25,6 +25,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -73,6 +74,9 @@ class VocabularyQuestPluginMockBukkitTest {
         CommandResult playerImportResult = server.executePlayer("importvocab", "en");
         playerImportResult.assertResponse("This command is restricted to RCON.");
 
+        CommandResult playerPlaytimeResult = server.executePlayer("playtime", "status", "Alice");
+        playerPlaytimeResult.assertResponse("This command is restricted to RCON.");
+
         CommandResult consoleDumpResult = server.executeConsole("dbdump");
         consoleDumpResult.assertResponse("This command is restricted to RCON.");
 
@@ -91,6 +95,9 @@ class VocabularyQuestPluginMockBukkitTest {
 
         CommandResult consoleImportResult = server.executeConsole("importvocab", "en");
         consoleImportResult.assertResponse("This command is restricted to RCON.");
+
+        CommandResult consolePlaytimeResult = server.executeConsole("playtime", "status", "Alice");
+        consolePlaytimeResult.assertResponse("This command is restricted to RCON.");
     }
 
     @Test
@@ -124,11 +131,27 @@ class VocabularyQuestPluginMockBukkitTest {
         assertNotNull(importVocab);
         assertTrue(plugin.onCommand(rcon, importVocab, "importvocab", new String[]{"fr"}));
 
+        PluginCommand playtime = server.getPluginCommand("playtime");
+        assertNotNull(playtime);
+        assertTrue(plugin.onCommand(rcon, playtime, "playtime", new String[]{"status", "alice"}));
+        assertTrue(plugin.onCommand(rcon, playtime, "playtime", new String[]{"setlimit", "alice", "90"}));
+        assertTrue(plugin.onCommand(rcon, playtime, "playtime", new String[]{"setused", "alice", "12"}));
+        assertTrue(plugin.onCommand(rcon, playtime, "playtime", new String[]{"reset", "alice"}));
+        assertTrue(plugin.onCommand(rcon, playtime, "playtime", new String[]{"setlimit", "alice", "default"}));
+
+        SQLiteStore.PlayerPlaytime playtimeState = store.getOrCreatePlayerPlaytimeForToday(
+                "alice", LocalDate.now().toString(), 120);
+        assertEquals(0, playtimeState.dailyUsedMinutes());
+        assertNull(playtimeState.limitOverrideMinutes());
+        assertEquals(120, playtimeState.effectiveLimitMinutes());
+
         SQLiteStore.DumpSummary afterInsert = store.dumpToLog(java.util.logging.Logger.getLogger("test"));
         assertEquals(deEnBefore + 1, afterInsert.deEnEntries());
         assertTrue(messages.stream().anyMatch(m -> m.contains("Inserted vocabulary pair")));
         assertTrue(messages.stream().anyMatch(m -> m.contains("Set sheet URL for de_en.")));
         assertTrue(messages.stream().anyMatch(m -> m.contains("No sheet URL configured for de_fr")));
+        assertTrue(messages.stream().anyMatch(m -> m.contains("Playtime for alice:")));
+        assertTrue(messages.stream().anyMatch(m -> m.contains("Updated alice limit override")));
 
         PluginCommand flushAnswers = server.getPluginCommand("flushanswers");
         assertNotNull(flushAnswers);
@@ -378,6 +401,40 @@ class VocabularyQuestPluginMockBukkitTest {
         } finally {
             httpServer.stop(0);
         }
+    }
+
+    @Test
+    void playtimeCommandRejectsInvalidInputAndResistsSqlLikePayload() throws Exception {
+        SQLiteStore store = getSQLiteStore();
+        List<String> messages = new ArrayList<>();
+        RemoteConsoleCommandSender rcon = createRconSender(messages);
+
+        PluginCommand playtime = server.getPluginCommand("playtime");
+        assertNotNull(playtime);
+
+        assertTrue(plugin.onCommand(rcon, playtime, "playtime", new String[]{"setused", "alice", "-1"}));
+        assertTrue(plugin.onCommand(rcon, playtime, "playtime", new String[]{"setlimit", "alice", "0"}));
+        assertTrue(plugin.onCommand(rcon, playtime, "playtime", new String[]{"setlimit", "alice", "1;DROP_TABLE"}));
+
+        assertTrue(messages.stream().anyMatch(m -> m.contains("Minutes must be a non-negative integer.")));
+        assertTrue(messages.stream().anyMatch(m -> m.contains("Limit must be a positive integer or 'default'.")));
+
+        SQLiteStore.PlayerPlaytime alice = store.getOrCreatePlayerPlaytimeForToday(
+                "alice", LocalDate.now().toString(), 120);
+        assertEquals(0, alice.dailyUsedMinutes());
+        assertNull(alice.limitOverrideMinutes());
+        assertEquals(120, alice.effectiveLimitMinutes());
+
+        String maliciousUsername = "attacker'); DROP TABLE player_playtime;--";
+        assertTrue(plugin.onCommand(rcon, playtime, "playtime", new String[]{"setused", maliciousUsername, "6"}));
+        assertTrue(plugin.onCommand(rcon, playtime, "playtime", new String[]{"setlimit", maliciousUsername, "66"}));
+
+        // If schema survived SQL-like payload, regular user playtime and user upsert should still work.
+        store.upsertUser("normal-user-after-abuse");
+        SQLiteStore.PlayerPlaytime normal = store.getOrCreatePlayerPlaytimeForToday(
+                "normal-user-after-abuse", LocalDate.now().toString(), 120);
+        assertEquals(0, normal.dailyUsedMinutes());
+        assertEquals(120, normal.effectiveLimitMinutes());
     }
 
     private RemoteConsoleCommandSender createRconSender(List<String> sink) {

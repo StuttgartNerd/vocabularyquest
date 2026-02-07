@@ -326,6 +326,119 @@ class SQLiteStoreTest {
         }
     }
 
+    @Test
+    void playtimeTrackingResetsPerDayAndSupportsLimitOverrides() throws Exception {
+        Path db = tempDir.resolve("playtime-reset.db");
+        try (SQLiteStore store = new SQLiteStore(db)) {
+            store.initializeSchema();
+
+            String dayOne = "2026-02-07";
+            String dayTwo = "2026-02-08";
+
+            SQLiteStore.PlayerPlaytime initial = store.getOrCreatePlayerPlaytimeForToday("alice", dayOne, 120);
+            assertEquals(0, initial.dailyUsedMinutes());
+            assertEquals(120, initial.effectiveLimitMinutes());
+            assertNull(initial.limitOverrideMinutes());
+
+            SQLiteStore.PlayerPlaytime incremented =
+                    store.addDailyUsedMinutesForToday("alice", 5, dayOne, 120);
+            assertEquals(5, incremented.dailyUsedMinutes());
+            assertEquals(120, incremented.effectiveLimitMinutes());
+
+            SQLiteStore.PlayerPlaytime overrideSet =
+                    store.setLimitOverrideMinutesForToday("alice", 90, dayOne, 120);
+            assertEquals(90, overrideSet.limitOverrideMinutes());
+            assertEquals(90, overrideSet.effectiveLimitMinutes());
+
+            SQLiteStore.PlayerPlaytime nextDay = store.getOrCreatePlayerPlaytimeForToday("alice", dayTwo, 120);
+            assertEquals(0, nextDay.dailyUsedMinutes(), "Daily usage should reset when the date changes.");
+            assertEquals(90, nextDay.effectiveLimitMinutes(), "Limit override should persist across days.");
+            assertEquals(dayTwo, nextDay.lastResetDate());
+
+            SQLiteStore.PlayerPlaytime overrideCleared =
+                    store.setLimitOverrideMinutesForToday("alice", null, dayTwo, 120);
+            assertNull(overrideCleared.limitOverrideMinutes());
+            assertEquals(120, overrideCleared.effectiveLimitMinutes());
+        }
+    }
+
+    @Test
+    void playtimeResetCommandsAffectSingleAndAllPlayers() throws Exception {
+        Path db = tempDir.resolve("playtime-reset-commands.db");
+        try (SQLiteStore store = new SQLiteStore(db)) {
+            store.initializeSchema();
+            String today = "2026-02-07";
+
+            store.addDailyUsedMinutesForToday("alice", 7, today, 120);
+            store.addDailyUsedMinutesForToday("bob", 11, today, 120);
+
+            SQLiteStore.PlayerPlaytime aliceBefore = store.getOrCreatePlayerPlaytimeForToday("alice", today, 120);
+            SQLiteStore.PlayerPlaytime bobBefore = store.getOrCreatePlayerPlaytimeForToday("bob", today, 120);
+            assertEquals(7, aliceBefore.dailyUsedMinutes());
+            assertEquals(11, bobBefore.dailyUsedMinutes());
+
+            SQLiteStore.PlayerPlaytime aliceReset = store.resetDailyUsedMinutesForToday("alice", today, 120);
+            assertEquals(0, aliceReset.dailyUsedMinutes());
+
+            int resetAll = store.resetAllDailyUsedMinutesForToday(today);
+            assertEquals(2, resetAll);
+
+            SQLiteStore.PlayerPlaytime aliceAfter = store.getOrCreatePlayerPlaytimeForToday("alice", today, 120);
+            SQLiteStore.PlayerPlaytime bobAfter = store.getOrCreatePlayerPlaytimeForToday("bob", today, 120);
+            assertEquals(0, aliceAfter.dailyUsedMinutes());
+            assertEquals(0, bobAfter.dailyUsedMinutes());
+        }
+    }
+
+    @Test
+    void playtimeResetAllDoesNotDropLimitOverrides() throws Exception {
+        Path db = tempDir.resolve("playtime-reset-preserves-overrides.db");
+        try (SQLiteStore store = new SQLiteStore(db)) {
+            store.initializeSchema();
+            String today = "2026-02-07";
+
+            store.setLimitOverrideMinutesForToday("alice", 45, today, 120);
+            store.addDailyUsedMinutesForToday("alice", 9, today, 120);
+
+            int resetRows = store.resetAllDailyUsedMinutesForToday(today);
+            assertEquals(1, resetRows);
+
+            SQLiteStore.PlayerPlaytime alice = store.getOrCreatePlayerPlaytimeForToday("alice", today, 120);
+            assertEquals(0, alice.dailyUsedMinutes());
+            assertEquals(45, alice.effectiveLimitMinutes());
+            assertEquals(45, alice.limitOverrideMinutes());
+        }
+    }
+
+    @Test
+    void playtimeSqlLikeUsernameDoesNotInjectOrBreakSchema() throws Exception {
+        Path db = tempDir.resolve("playtime-abuse-input.db");
+        String maliciousUsername = "playtime_attacker'); DROP TABLE player_playtime;--";
+
+        try (SQLiteStore store = new SQLiteStore(db)) {
+            store.initializeSchema();
+            String today = "2026-02-07";
+
+            SQLiteStore.PlayerPlaytime created =
+                    store.getOrCreatePlayerPlaytimeForToday(maliciousUsername, today, 120);
+            assertEquals(0, created.dailyUsedMinutes());
+            assertEquals(120, created.effectiveLimitMinutes());
+
+            SQLiteStore.PlayerPlaytime updated =
+                    store.addDailyUsedMinutesForToday(maliciousUsername, 4, today, 120);
+            assertEquals(4, updated.dailyUsedMinutes());
+
+            store.setLimitOverrideMinutesForToday(maliciousUsername, 75, today, 120);
+
+            // If schema remains intact after malicious-like input, normal writes still work.
+            store.upsertUser("normal-user");
+            SQLiteStore.PlayerPlaytime normal =
+                    store.getOrCreatePlayerPlaytimeForToday("normal-user", today, 120);
+            assertEquals(0, normal.dailyUsedMinutes());
+            assertEquals(120, normal.effectiveLimitMinutes());
+        }
+    }
+
     private String selectTranslation(Path dbPath, String table, String column, String deWord) throws SQLException {
         try (Connection connection = DriverManager.getConnection("jdbc:sqlite:" + dbPath.toAbsolutePath());
              PreparedStatement statement = connection.prepareStatement(

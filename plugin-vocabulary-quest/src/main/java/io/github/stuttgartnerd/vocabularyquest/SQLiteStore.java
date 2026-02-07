@@ -25,6 +25,10 @@ final class SQLiteStore implements AutoCloseable {
     record DumpSummary(int users, int deEnEntries, int deFrEntries, int rewards, int attempts) {
     }
 
+    record PlayerPlaytime(String username, int dailyUsedMinutes, Integer limitOverrideMinutes,
+                          int effectiveLimitMinutes, String lastResetDate) {
+    }
+
     private final Connection connection;
 
     SQLiteStore(Path dbPath) throws SQLException {
@@ -76,6 +80,14 @@ final class SQLiteStore implements AutoCloseable {
             statement.executeUpdate("""
                     CREATE INDEX IF NOT EXISTS idx_vocab_attempts_table_word
                     ON vocab_attempts (vocab_table, de_word)
+                    """);
+            statement.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS player_playtime (
+                        username TEXT PRIMARY KEY,
+                        daily_used_minutes INTEGER NOT NULL DEFAULT 0,
+                        limit_override_minutes INTEGER,
+                        last_reset_date TEXT NOT NULL
+                    )
                     """);
         }
     }
@@ -353,6 +365,127 @@ final class SQLiteStore implements AutoCloseable {
         return eligibleEntries.get(eligibleEntries.size() - 1);
     }
 
+    synchronized PlayerPlaytime getOrCreatePlayerPlaytimeForToday(String username, String todayDate,
+                                                                  int defaultLimitMinutes) throws SQLException {
+        ensurePlayerPlaytimeRow(username, todayDate);
+
+        String sql = """
+                SELECT daily_used_minutes, limit_override_minutes, last_reset_date
+                FROM player_playtime
+                WHERE username = ?
+                """;
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, username);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (!resultSet.next()) {
+                    throw new SQLException("Missing player_playtime row after ensure for user: " + username);
+                }
+
+                int dailyUsed = resultSet.getInt("daily_used_minutes");
+                int limitOverrideRaw = resultSet.getInt("limit_override_minutes");
+                Integer limitOverride = resultSet.wasNull() ? null : limitOverrideRaw;
+                String lastResetDate = resultSet.getString("last_reset_date");
+
+                if (!todayDate.equals(lastResetDate)) {
+                    dailyUsed = 0;
+                    lastResetDate = todayDate;
+                    try (PreparedStatement reset = connection.prepareStatement("""
+                            UPDATE player_playtime
+                            SET daily_used_minutes = 0, last_reset_date = ?
+                            WHERE username = ?
+                            """)) {
+                        reset.setString(1, todayDate);
+                        reset.setString(2, username);
+                        reset.executeUpdate();
+                    }
+                }
+
+                int effectiveLimit = resolveEffectiveLimitMinutes(defaultLimitMinutes, limitOverride);
+                return new PlayerPlaytime(username, dailyUsed, limitOverride, effectiveLimit, lastResetDate);
+            }
+        }
+    }
+
+    synchronized PlayerPlaytime addDailyUsedMinutesForToday(String username, int deltaMinutes, String todayDate,
+                                                            int defaultLimitMinutes) throws SQLException {
+        PlayerPlaytime current = getOrCreatePlayerPlaytimeForToday(username, todayDate, defaultLimitMinutes);
+        int updatedUsed = Math.max(0, current.dailyUsedMinutes() + deltaMinutes);
+
+        try (PreparedStatement statement = connection.prepareStatement("""
+                UPDATE player_playtime
+                SET daily_used_minutes = ?, last_reset_date = ?
+                WHERE username = ?
+                """)) {
+            statement.setInt(1, updatedUsed);
+            statement.setString(2, todayDate);
+            statement.setString(3, username);
+            statement.executeUpdate();
+        }
+
+        return new PlayerPlaytime(username, updatedUsed, current.limitOverrideMinutes(),
+                current.effectiveLimitMinutes(), todayDate);
+    }
+
+    synchronized PlayerPlaytime setDailyUsedMinutesForToday(String username, int minutes, String todayDate,
+                                                            int defaultLimitMinutes) throws SQLException {
+        PlayerPlaytime current = getOrCreatePlayerPlaytimeForToday(username, todayDate, defaultLimitMinutes);
+        int normalizedMinutes = Math.max(0, minutes);
+
+        try (PreparedStatement statement = connection.prepareStatement("""
+                UPDATE player_playtime
+                SET daily_used_minutes = ?, last_reset_date = ?
+                WHERE username = ?
+                """)) {
+            statement.setInt(1, normalizedMinutes);
+            statement.setString(2, todayDate);
+            statement.setString(3, username);
+            statement.executeUpdate();
+        }
+
+        return new PlayerPlaytime(username, normalizedMinutes, current.limitOverrideMinutes(),
+                current.effectiveLimitMinutes(), todayDate);
+    }
+
+    synchronized PlayerPlaytime setLimitOverrideMinutesForToday(String username, Integer limitOverrideMinutes,
+                                                                String todayDate,
+                                                                int defaultLimitMinutes) throws SQLException {
+        PlayerPlaytime current = getOrCreatePlayerPlaytimeForToday(username, todayDate, defaultLimitMinutes);
+
+        try (PreparedStatement statement = connection.prepareStatement("""
+                UPDATE player_playtime
+                SET limit_override_minutes = ?, last_reset_date = ?
+                WHERE username = ?
+                """)) {
+            if (limitOverrideMinutes == null) {
+                statement.setNull(1, java.sql.Types.INTEGER);
+            } else {
+                statement.setInt(1, Math.max(1, limitOverrideMinutes));
+            }
+            statement.setString(2, todayDate);
+            statement.setString(3, username);
+            statement.executeUpdate();
+        }
+
+        Integer normalizedOverride = limitOverrideMinutes == null ? null : Math.max(1, limitOverrideMinutes);
+        int effectiveLimit = resolveEffectiveLimitMinutes(defaultLimitMinutes, normalizedOverride);
+        return new PlayerPlaytime(username, current.dailyUsedMinutes(), normalizedOverride, effectiveLimit, todayDate);
+    }
+
+    synchronized PlayerPlaytime resetDailyUsedMinutesForToday(String username, String todayDate,
+                                                              int defaultLimitMinutes) throws SQLException {
+        return setDailyUsedMinutesForToday(username, 0, todayDate, defaultLimitMinutes);
+    }
+
+    synchronized int resetAllDailyUsedMinutesForToday(String todayDate) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("""
+                UPDATE player_playtime
+                SET daily_used_minutes = 0, last_reset_date = ?
+                """)) {
+            statement.setString(1, todayDate);
+            return statement.executeUpdate();
+        }
+    }
+
     private void replaceVocabulary(String table, String rightColumn, List<VocabEntry> entries) throws SQLException {
         boolean previousAutoCommit = connection.getAutoCommit();
         connection.setAutoCommit(false);
@@ -491,6 +624,22 @@ final class SQLiteStore implements AutoCloseable {
 
     private String rewardKey(String username, String vocabTable, String deWord) {
         return username + "|" + vocabTable + "|" + deWord;
+    }
+
+    private void ensurePlayerPlaytimeRow(String username, String todayDate) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("""
+                INSERT INTO player_playtime (username, daily_used_minutes, limit_override_minutes, last_reset_date)
+                VALUES (?, 0, NULL, ?)
+                ON CONFLICT(username) DO NOTHING
+                """)) {
+            statement.setString(1, username);
+            statement.setString(2, todayDate);
+            statement.executeUpdate();
+        }
+    }
+
+    private int resolveEffectiveLimitMinutes(int defaultLimitMinutes, Integer limitOverrideMinutes) {
+        return limitOverrideMinutes == null ? defaultLimitMinutes : Math.max(1, limitOverrideMinutes);
     }
 
     @Override

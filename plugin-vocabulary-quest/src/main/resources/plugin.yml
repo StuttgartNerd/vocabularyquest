@@ -29,3 +29,6 @@ commands:
   importvocab:
     description: RCON only, merges de-en or de-fr vocabulary from configured sheet URL
     usage: /importvocab <en|fr>
+  playtime:
+    description: RCON only, manage daily playtime limits and usage
+    usage: /playtime <status|setused|setlimit|reset> ...

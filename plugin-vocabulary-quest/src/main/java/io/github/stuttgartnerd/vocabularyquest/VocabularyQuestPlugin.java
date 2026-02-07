@@ -13,6 +13,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerLoginEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
@@ -24,6 +25,7 @@ import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.SQLException;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -39,12 +41,16 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
     private static final String ADD_VOCAB_COMMAND = "addvocab";
     private static final String SET_VOCAB_URL_COMMAND = "setvocaburl";
     private static final String IMPORT_VOCAB_COMMAND = "importvocab";
+    private static final String PLAYTIME_COMMAND = "playtime";
     private static final String ANSWER_COMMAND = "answer";
     private static final String QUEST_NOW_COMMAND = "questnow";
     private static final String CONFIG_SHEET_URL_EN = "vocab_import.sheet_urls.en";
     private static final String CONFIG_SHEET_URL_FR = "vocab_import.sheet_urls.fr";
     private static final String CONFIG_HTTP_CONNECT_TIMEOUT_SECONDS = "vocab_import.http.connect_timeout_seconds";
     private static final String CONFIG_HTTP_READ_TIMEOUT_SECONDS = "vocab_import.http.read_timeout_seconds";
+    private static final String CONFIG_PLAYTIME_ENABLED = "playtime.enabled";
+    private static final String CONFIG_PLAYTIME_DEFAULT_DAILY_LIMIT_MINUTES = "playtime.default_daily_limit_minutes";
+    private static final String CONFIG_PLAYTIME_KICK_MESSAGE = "playtime.kick_message";
     private static final long QUEST_TIMEOUT_TICKS = 2L * 60L * 20L;
     private static final int QUEST_DELAY_MIN_SECONDS = 3 * 60;
     private static final int QUEST_DELAY_MAX_SECONDS = 10 * 60;
@@ -53,11 +59,15 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
     private static final int MAX_VOCAB_TERM_LENGTH = 64;
     private static final int DEFAULT_HTTP_CONNECT_TIMEOUT_SECONDS = 10;
     private static final int DEFAULT_HTTP_READ_TIMEOUT_SECONDS = 20;
+    private static final int DEFAULT_PLAYTIME_DAILY_LIMIT_MINUTES = 120;
+    private static final String DEFAULT_PLAYTIME_KICK_MESSAGE = "Daily playtime limit reached ({used}/{limit} min). "
+            + "Come back tomorrow.";
 
     private final Random random = new Random();
     private SQLiteStore sqliteStore;
     private BukkitTask scheduledQuestTask;
     private BukkitTask questTimeoutTask;
+    private BukkitTask playtimeTrackerTask;
     private ActiveQuest activeQuest;
 
     private record ActiveQuest(String vocabTable, String deWord, String answer) {
@@ -81,8 +91,10 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
 
         getServer().getPluginManager().registerEvents(this, this);
         for (Player onlinePlayer : Bukkit.getOnlinePlayers()) {
-            upsertUser(onlinePlayer.getName());
+            registerPlayerForPlaytime(onlinePlayer.getName());
+            enforcePlaytimeLimit(onlinePlayer);
         }
+        startPlaytimeTracker();
         scheduleNextQuest();
         getLogger().info("VocabularyQuestPlugin enabled.");
     }
@@ -91,6 +103,7 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
     public void onDisable() {
         cancelScheduledQuest();
         cancelQuestTimeout();
+        cancelPlaytimeTracker();
 
         if (sqliteStore != null) {
             try {
@@ -294,6 +307,10 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
             return true;
         }
 
+        if (PLAYTIME_COMMAND.equalsIgnoreCase(command.getName())) {
+            return handlePlaytimeCommand(sender, args);
+        }
+
         if (ANSWER_COMMAND.equalsIgnoreCase(command.getName())) {
             if (!(sender instanceof Player player)) {
                 sender.sendMessage("Only players can answer quests.");
@@ -350,8 +367,33 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
     }
 
     @EventHandler(ignoreCancelled = true)
+    public void onPlayerLogin(PlayerLoginEvent event) {
+        if (!isPlaytimeLimitEnabled()) {
+            return;
+        }
+
+        String username = sanitizeUserInput(event.getPlayer().getName());
+        if (username.isBlank()) {
+            return;
+        }
+
+        registerPlayerForPlaytime(username);
+
+        SQLiteStore.PlayerPlaytime playtime = getPlayerPlaytime(username);
+        if (playtime == null) {
+            return;
+        }
+
+        if (playtime.dailyUsedMinutes() >= playtime.effectiveLimitMinutes()) {
+            event.disallow(PlayerLoginEvent.Result.KICK_OTHER,
+                    buildPlaytimeKickMessage(playtime.dailyUsedMinutes(), playtime.effectiveLimitMinutes()));
+        }
+    }
+
+    @EventHandler(ignoreCancelled = true)
     public void onPlayerJoin(PlayerJoinEvent event) {
-        upsertUser(event.getPlayer().getName());
+        registerPlayerForPlaytime(event.getPlayer().getName());
+        enforcePlaytimeLimit(event.getPlayer());
     }
 
     @EventHandler(ignoreCancelled = true)
@@ -454,16 +496,165 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    private void upsertUser(String username) {
+    private void registerPlayerForPlaytime(String username) {
         if (sqliteStore == null || username == null || username.isBlank()) {
             return;
         }
 
+        String normalized = username.trim();
+        String todayDate = todayDate();
         try {
-            sqliteStore.upsertUser(username.trim());
+            sqliteStore.upsertUser(normalized);
+            sqliteStore.getOrCreatePlayerPlaytimeForToday(normalized, todayDate, getDefaultPlaytimeLimitMinutes());
         } catch (SQLException e) {
-            getLogger().log(Level.WARNING, "Failed to upsert user '" + username + "'.", e);
+            getLogger().log(Level.WARNING, "Failed to register player '" + normalized + "' for playtime.", e);
         }
+    }
+
+    private boolean handlePlaytimeCommand(CommandSender sender, String[] args) {
+        if (!isRconSender(sender)) {
+            sender.sendMessage("This command is restricted to RCON.");
+            return true;
+        }
+
+        if (sqliteStore == null) {
+            sender.sendMessage("SQLite store is not available.");
+            return true;
+        }
+
+        if (args.length == 0) {
+            sender.sendMessage("Usage: /playtime <status|setused|setlimit|reset> ...");
+            sender.sendMessage("Usage: /playtime status <player>");
+            sender.sendMessage("Usage: /playtime setused <player> <minutes>");
+            sender.sendMessage("Usage: /playtime setlimit <player> <minutes|default>");
+            sender.sendMessage("Usage: /playtime reset <player|all>");
+            return true;
+        }
+
+        String action = sanitizeUserInput(args[0]).toLowerCase(Locale.ROOT);
+        int defaultLimit = getDefaultPlaytimeLimitMinutes();
+        String todayDate = todayDate();
+
+        try {
+            if ("status".equals(action)) {
+                if (args.length != 2) {
+                    sender.sendMessage("Usage: /playtime status <player>");
+                    return true;
+                }
+
+                String username = sanitizeUserInput(args[1]);
+                if (username.isBlank()) {
+                    sender.sendMessage("Player name is required.");
+                    return true;
+                }
+
+                registerPlayerForPlaytime(username);
+                SQLiteStore.PlayerPlaytime state =
+                        sqliteStore.getOrCreatePlayerPlaytimeForToday(username, todayDate, defaultLimit);
+                String overrideValue = state.limitOverrideMinutes() == null
+                        ? "default"
+                        : String.valueOf(state.limitOverrideMinutes());
+                sender.sendMessage("Playtime for " + username + ": used=" + state.dailyUsedMinutes()
+                        + "/" + state.effectiveLimitMinutes() + " min, limitOverride=" + overrideValue
+                        + ", date=" + state.lastResetDate());
+                return true;
+            }
+
+            if ("setused".equals(action)) {
+                if (args.length != 3) {
+                    sender.sendMessage("Usage: /playtime setused <player> <minutes>");
+                    return true;
+                }
+
+                String username = sanitizeUserInput(args[1]);
+                if (username.isBlank()) {
+                    sender.sendMessage("Player name is required.");
+                    return true;
+                }
+
+                Integer minutes = parseNonNegativeInt(args[2]);
+                if (minutes == null) {
+                    sender.sendMessage("Minutes must be a non-negative integer.");
+                    return true;
+                }
+
+                registerPlayerForPlaytime(username);
+                SQLiteStore.PlayerPlaytime updated =
+                        sqliteStore.setDailyUsedMinutesForToday(username, minutes, todayDate, defaultLimit);
+                sender.sendMessage("Updated " + username + " daily used playtime to " + updated.dailyUsedMinutes()
+                        + "/" + updated.effectiveLimitMinutes() + " min.");
+                kickOnlinePlayerIfLimitReached(username, updated);
+                return true;
+            }
+
+            if ("setlimit".equals(action)) {
+                if (args.length != 3) {
+                    sender.sendMessage("Usage: /playtime setlimit <player> <minutes|default>");
+                    return true;
+                }
+
+                String username = sanitizeUserInput(args[1]);
+                if (username.isBlank()) {
+                    sender.sendMessage("Player name is required.");
+                    return true;
+                }
+
+                String limitValue = sanitizeUserInput(args[2]);
+                Integer overrideLimit = null;
+                if (!"default".equalsIgnoreCase(limitValue)) {
+                    overrideLimit = parsePositiveInt(limitValue);
+                    if (overrideLimit == null) {
+                        sender.sendMessage("Limit must be a positive integer or 'default'.");
+                        return true;
+                    }
+                }
+
+                registerPlayerForPlaytime(username);
+                SQLiteStore.PlayerPlaytime updated =
+                        sqliteStore.setLimitOverrideMinutesForToday(username, overrideLimit, todayDate, defaultLimit);
+
+                String overrideText = updated.limitOverrideMinutes() == null
+                        ? "default (" + defaultLimit + ")"
+                        : String.valueOf(updated.limitOverrideMinutes());
+                sender.sendMessage("Updated " + username + " limit override to " + overrideText
+                        + ". Effective daily limit: " + updated.effectiveLimitMinutes() + " min.");
+                kickOnlinePlayerIfLimitReached(username, updated);
+                return true;
+            }
+
+            if ("reset".equals(action)) {
+                if (args.length != 2) {
+                    sender.sendMessage("Usage: /playtime reset <player|all>");
+                    return true;
+                }
+
+                String target = sanitizeUserInput(args[1]);
+                if (target.isBlank()) {
+                    sender.sendMessage("Player name is required.");
+                    return true;
+                }
+
+                if ("all".equalsIgnoreCase(target)) {
+                    int updatedRows = sqliteStore.resetAllDailyUsedMinutesForToday(todayDate);
+                    sender.sendMessage("Reset daily playtime usage for " + updatedRows + " players.");
+                    return true;
+                }
+
+                registerPlayerForPlaytime(target);
+                SQLiteStore.PlayerPlaytime updated =
+                        sqliteStore.resetDailyUsedMinutesForToday(target, todayDate, defaultLimit);
+                sender.sendMessage("Reset daily playtime usage for " + target + ". Current usage: "
+                        + updated.dailyUsedMinutes() + "/" + updated.effectiveLimitMinutes() + " min.");
+                return true;
+            }
+        } catch (SQLException e) {
+            getLogger().log(Level.WARNING, "Failed to process playtime command.", e);
+            sender.sendMessage("Failed to process playtime command. Check server log.");
+            return true;
+        }
+
+        sender.sendMessage("Usage: /playtime <status|setused|setlimit|reset> ...");
+        return true;
     }
 
     private void handleQuestAnswer(Player player, String rawAnswer) {
@@ -638,6 +829,52 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    private void startPlaytimeTracker() {
+        cancelPlaytimeTracker();
+        if (!isPlaytimeLimitEnabled()) {
+            return;
+        }
+
+        playtimeTrackerTask = Bukkit.getScheduler().runTaskTimer(
+                this,
+                this::trackOnlinePlaytimeUsage,
+                20L * 60L,
+                20L * 60L
+        );
+    }
+
+    private void cancelPlaytimeTracker() {
+        if (playtimeTrackerTask != null) {
+            playtimeTrackerTask.cancel();
+            playtimeTrackerTask = null;
+        }
+    }
+
+    private void trackOnlinePlaytimeUsage() {
+        if (!isPlaytimeLimitEnabled() || sqliteStore == null) {
+            return;
+        }
+
+        String todayDate = todayDate();
+        int defaultLimit = getDefaultPlaytimeLimitMinutes();
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            String username = sanitizeUserInput(player.getName());
+            if (username.isBlank()) {
+                continue;
+            }
+
+            try {
+                SQLiteStore.PlayerPlaytime updated =
+                        sqliteStore.addDailyUsedMinutesForToday(username, 1, todayDate, defaultLimit);
+                if (updated.dailyUsedMinutes() >= updated.effectiveLimitMinutes()) {
+                    player.kickPlayer(buildPlaytimeKickMessage(updated.dailyUsedMinutes(), updated.effectiveLimitMinutes()));
+                }
+            } catch (SQLException e) {
+                getLogger().log(Level.WARNING, "Failed to track playtime for " + username + ".", e);
+            }
+        }
+    }
+
     private void broadcastSolution(ActiveQuest quest) {
         if (quest == null) {
             return;
@@ -656,6 +893,90 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
         for (ItemStack stack : leftover.values()) {
             player.getWorld().dropItemNaturally(player.getLocation(), stack);
         }
+    }
+
+    private SQLiteStore.PlayerPlaytime getPlayerPlaytime(String username) {
+        if (!isPlaytimeLimitEnabled() || sqliteStore == null || username == null || username.isBlank()) {
+            return null;
+        }
+
+        try {
+            return sqliteStore.getOrCreatePlayerPlaytimeForToday(username.trim(), todayDate(),
+                    getDefaultPlaytimeLimitMinutes());
+        } catch (SQLException e) {
+            getLogger().log(Level.WARNING, "Failed to load playtime for " + username + ".", e);
+            return null;
+        }
+    }
+
+    private void enforcePlaytimeLimit(Player player) {
+        if (!isPlaytimeLimitEnabled() || player == null) {
+            return;
+        }
+
+        String username = sanitizeUserInput(player.getName());
+        SQLiteStore.PlayerPlaytime playtime = getPlayerPlaytime(username);
+        if (playtime == null) {
+            return;
+        }
+
+        if (playtime.dailyUsedMinutes() >= playtime.effectiveLimitMinutes()) {
+            player.kickPlayer(buildPlaytimeKickMessage(playtime.dailyUsedMinutes(), playtime.effectiveLimitMinutes()));
+        }
+    }
+
+    private void kickOnlinePlayerIfLimitReached(String username, SQLiteStore.PlayerPlaytime playtime) {
+        if (username == null || username.isBlank() || playtime == null) {
+            return;
+        }
+
+        if (playtime.dailyUsedMinutes() < playtime.effectiveLimitMinutes()) {
+            return;
+        }
+
+        Player onlinePlayer = Bukkit.getPlayerExact(username);
+        if (onlinePlayer == null) {
+            return;
+        }
+
+        onlinePlayer.kickPlayer(buildPlaytimeKickMessage(playtime.dailyUsedMinutes(), playtime.effectiveLimitMinutes()));
+    }
+
+    private boolean isPlaytimeLimitEnabled() {
+        return getConfig().getBoolean(CONFIG_PLAYTIME_ENABLED, true);
+    }
+
+    private int getDefaultPlaytimeLimitMinutes() {
+        return Math.max(1, getConfig().getInt(CONFIG_PLAYTIME_DEFAULT_DAILY_LIMIT_MINUTES,
+                DEFAULT_PLAYTIME_DAILY_LIMIT_MINUTES));
+    }
+
+    private String buildPlaytimeKickMessage(int usedMinutes, int limitMinutes) {
+        String template = getConfig().getString(CONFIG_PLAYTIME_KICK_MESSAGE, DEFAULT_PLAYTIME_KICK_MESSAGE);
+        return template
+                .replace("{used}", String.valueOf(usedMinutes))
+                .replace("{limit}", String.valueOf(limitMinutes));
+    }
+
+    private String todayDate() {
+        return LocalDate.now().toString();
+    }
+
+    private Integer parseNonNegativeInt(String raw) {
+        try {
+            int value = Integer.parseInt(sanitizeUserInput(raw));
+            return value < 0 ? null : value;
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private Integer parsePositiveInt(String raw) {
+        Integer value = parseNonNegativeInt(raw);
+        if (value == null || value <= 0) {
+            return null;
+        }
+        return value;
     }
 
     private boolean isSameQuest(ActiveQuest a, ActiveQuest b) {

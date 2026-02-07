@@ -18,6 +18,8 @@ SMOKE_NEW_EN_DE_WORD="smoke_new_en_${SMOKE_RUN_ID}"
 SMOKE_NEW_EN_VALUE="new_en_${SMOKE_RUN_ID}"
 SMOKE_NEW_FR_DE_WORD="smoke_new_fr_${SMOKE_RUN_ID}"
 SMOKE_NEW_FR_VALUE="new_fr_${SMOKE_RUN_ID}"
+SMOKE_PLAYTIME_LIMIT=5
+SMOKE_PLAYTIME_USED=2
 
 SERVER_LOG="$ROOT_DIR/paper/logs/latest.log"
 DB_PATH="$ROOT_DIR/paper/plugins/VocabularyQuestPlugin/mindcraft.db"
@@ -359,6 +361,96 @@ fi
 
 wait_for_player_online 30 || {
   echo "[smoke] Bot did not appear as online player."
+  tail -n 200 "$SERVER_LOG" || true
+  echo "----- bot log -----"
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+}
+
+echo "[smoke] Verifying playtime commands via RCON..."
+rcon_cmd "playtime reset ${MC_USERNAME}" >/dev/null
+rcon_cmd "playtime setlimit ${MC_USERNAME} ${SMOKE_PLAYTIME_LIMIT}" >/dev/null
+
+playtime_status="$(
+  rcon_cmd "playtime status ${MC_USERNAME}" | tr -d '\r'
+)"
+if [[ "$playtime_status" != *"used=0/${SMOKE_PLAYTIME_LIMIT} min"* ]]; then
+  echo "[smoke] Unexpected playtime status after setlimit/reset: ${playtime_status}"
+  exit 1
+fi
+
+rcon_cmd "playtime setused ${MC_USERNAME} ${SMOKE_PLAYTIME_USED}" >/dev/null
+playtime_status="$(
+  rcon_cmd "playtime status ${MC_USERNAME}" | tr -d '\r'
+)"
+if [[ "$playtime_status" != *"used=${SMOKE_PLAYTIME_USED}/${SMOKE_PLAYTIME_LIMIT} min"* ]]; then
+  echo "[smoke] Unexpected playtime status after setused: ${playtime_status}"
+  exit 1
+fi
+
+echo "[smoke] Security abuse check: SQL-like playtime limit payload must be rejected..."
+playtime_abuse_response="$(
+  rcon_cmd "playtime setlimit ${MC_USERNAME} 1;DROP_TABLE" | tr -d '\r'
+)"
+if [[ "$playtime_abuse_response" != *"Limit must be a positive integer or 'default'."* ]]; then
+  echo "[smoke] Expected validation rejection for SQL-like setlimit payload."
+  echo "[smoke] Response: ${playtime_abuse_response}"
+  exit 1
+fi
+
+playtime_status_after_abuse="$(
+  rcon_cmd "playtime status ${MC_USERNAME}" | tr -d '\r'
+)"
+if [[ "$playtime_status_after_abuse" != *"used=${SMOKE_PLAYTIME_USED}/${SMOKE_PLAYTIME_LIMIT} min"* ]]; then
+  echo "[smoke] Playtime state changed unexpectedly after SQL-like RCON payload: ${playtime_status_after_abuse}"
+  exit 1
+fi
+
+echo "[smoke] Security abuse check: player-triggered /playtime must be blocked..."
+stop_bot_process
+sleep 1
+start_bot_process "/playtime setused ${MC_USERNAME} 9999" 2500 12
+
+wait_for_bot_line "Connected\\." 25 || {
+  echo "[smoke] Playtime abuse-check bot did not connect."
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+}
+
+wait_for_player_online 30 || {
+  echo "[smoke] Playtime abuse-check bot did not appear online."
+  tail -n 200 "$SERVER_LOG" || true
+  echo "----- bot log -----"
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+}
+
+wait_for_bot_line "This command is restricted to RCON." 20 || {
+  echo "[smoke] Expected player-side /playtime rejection was not observed in bot output."
+  tail -n 200 "$SERVER_LOG" || true
+  echo "----- bot log -----"
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+}
+
+playtime_status_after_player_abuse="$(
+  rcon_cmd "playtime status ${MC_USERNAME}" | tr -d '\r'
+)"
+if [[ "$playtime_status_after_player_abuse" != *"used=${SMOKE_PLAYTIME_USED}/${SMOKE_PLAYTIME_LIMIT} min"* ]]; then
+  echo "[smoke] Playtime state changed unexpectedly after player-side /playtime abuse: ${playtime_status_after_player_abuse}"
+  exit 1
+fi
+
+stop_bot_process
+sleep 1
+start_bot_process "" 0 240
+wait_for_bot_line "Connected\\." 25 || {
+  echo "[smoke] Bot did not reconnect after playtime abuse check."
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+}
+wait_for_player_online 30 || {
+  echo "[smoke] Bot did not appear online after playtime abuse reconnect."
   tail -n 200 "$SERVER_LOG" || true
   echo "----- bot log -----"
   tail -n 200 "$BOT_LOG" || true
