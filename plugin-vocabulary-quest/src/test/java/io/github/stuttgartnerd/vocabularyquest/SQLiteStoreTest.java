@@ -3,7 +3,13 @@ package io.github.stuttgartnerd.vocabularyquest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.List;
 import java.util.Random;
@@ -96,6 +102,41 @@ class SQLiteStoreTest {
             assertEquals(1, summary.deFrEntries());
 
             assertThrows(SQLException.class, () -> store.insertVocabularyEntry("it", "haus", "casa"));
+        }
+    }
+
+    @Test
+    void mergeImportAddsOnlyMissingRowsAndDoesNotOverwriteExistingTranslations() throws Exception {
+        Path db = tempDir.resolve("merge-import.db");
+
+        try (SQLiteStore store = new SQLiteStore(db)) {
+            store.initializeSchema();
+            store.replaceDeEn(List.of(new SQLiteStore.VocabEntry("haus", "legacy-house")));
+            store.replaceDeFr(List.of(new SQLiteStore.VocabEntry("haus", "ancienne-maison")));
+            store.recordAttempt("alice", "de_en", "haus", false);
+            store.recordAttempt("alice", "de_fr", "haus", false);
+
+            int insertedEn = store.insertMissingVocabularyEntries("en", List.of(
+                    new SQLiteStore.VocabEntry("haus", "new-house"),
+                    new SQLiteStore.VocabEntry("baum", "tree")
+            ));
+            int insertedFr = store.insertMissingVocabularyEntries("fr", List.of(
+                    new SQLiteStore.VocabEntry("haus", "nouvelle-maison"),
+                    new SQLiteStore.VocabEntry("baum", "arbre")
+            ));
+
+            assertEquals(1, insertedEn);
+            assertEquals(1, insertedFr);
+
+            SQLiteStore.DumpSummary summary = store.dumpToLog(TEST_LOGGER);
+            assertEquals(2, summary.deEnEntries());
+            assertEquals(2, summary.deFrEntries());
+            assertEquals(2, summary.attempts(), "Merge import must not reset attempt counters.");
+
+            assertEquals("legacy-house", selectTranslation(db, "vocab_de_en", "en", "haus"));
+            assertEquals("tree", selectTranslation(db, "vocab_de_en", "en", "baum"));
+            assertEquals("ancienne-maison", selectTranslation(db, "vocab_de_fr", "fr", "haus"));
+            assertEquals("arbre", selectTranslation(db, "vocab_de_fr", "fr", "baum"));
         }
     }
 
@@ -246,6 +287,53 @@ class SQLiteStoreTest {
             // If schema is intact, normal writes still work after malicious-like input.
             store.upsertUser("normal-user");
             assertEquals(2, store.dumpToLog(TEST_LOGGER).users());
+        }
+    }
+
+    @Test
+    void sheetImportWithSqlLikePayloadDoesNotInjectSql() throws Exception {
+        Path db = tempDir.resolve("abuse-sheet-import.db");
+        Path csv = tempDir.resolve("abuse-sheet.csv");
+
+        String maliciousDe = "haus'); DROP TABLE users;--";
+        String maliciousEn = "house'); DELETE FROM vocab_attempts;--";
+        String csvContent = """
+                de,en
+                haus'); DROP TABLE users;--,house'); DELETE FROM vocab_attempts;--
+                baum,tree
+                """;
+        Files.writeString(csv, csvContent, StandardCharsets.UTF_8);
+
+        List<SQLiteStore.VocabEntry> sheetEntries = VocabularyCsvImport.loadFromPath(csv, "de", "en", TEST_LOGGER);
+        assertEquals(2, sheetEntries.size());
+
+        try (SQLiteStore store = new SQLiteStore(db)) {
+            store.initializeSchema();
+            int inserted = store.insertMissingVocabularyEntries("en", sheetEntries);
+            assertEquals(2, inserted);
+
+            // If import payload caused injection, these follow-up writes would fail due to broken schema.
+            store.upsertUser("normal-user");
+            store.recordAttempt("normal-user", "de_en", maliciousDe, false);
+            assertTrue(store.claimReward("normal-user", "de_en", maliciousDe));
+
+            SQLiteStore.DumpSummary summary = store.dumpToLog(TEST_LOGGER);
+            assertEquals(1, summary.users());
+            assertEquals(2, summary.deEnEntries());
+            assertEquals(1, summary.rewards());
+            assertEquals(1, summary.attempts());
+            assertEquals(maliciousEn, selectTranslation(db, "vocab_de_en", "en", maliciousDe));
+        }
+    }
+
+    private String selectTranslation(Path dbPath, String table, String column, String deWord) throws SQLException {
+        try (Connection connection = DriverManager.getConnection("jdbc:sqlite:" + dbPath.toAbsolutePath());
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT " + column + " FROM " + table + " WHERE lower(de)=lower(?) ORDER BY id ASC LIMIT 1")) {
+            statement.setString(1, deWord);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                return resultSet.next() ? resultSet.getString(column) : null;
+            }
         }
     }
 }

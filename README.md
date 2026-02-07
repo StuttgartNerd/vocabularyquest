@@ -1,71 +1,18 @@
 # Mindcraft Trainer
 
-Paper server + plugin + Java chatbot for vocabulary quests (DE->EN / DE->FR), with SQLite persistence.
+Paper plugin for vocabulary quests (DE->EN / DE->FR) with SQLite persistence.
 
-## What You Get
+## Install Plugin (End Users)
 
-- Local Paper server (`paper/`) in offline mode for local testing.
-- Paper plugin (`plugin-vocabulary-quest/`) with:
-  - player join tracking in SQLite
-  - vocabulary tables (`vocab_de_en`, `vocab_de_fr`)
-  - timed quest events (every 3-10 minutes)
-  - rewards (1 emerald for correct first-time answer per player+word)
-- Java chatbot (`chat-bot/`) to simulate player chat and command input.
-- Helper scripts in `scripts/`.
+1. Download the latest plugin jar from GitHub Releases.
+2. Copy the jar to your Paper server `plugins/` directory.
+3. Start or restart the server.
 
-## Prerequisites
+Plugin name: `VocabularyQuestPlugin`
 
-- Java 21+
-- `curl`
-- `unzip`
-- `jq`
-- `python3` (for RCON helper)
+## Commands
 
-## Quick Start
-
-1. Download Paper (recommended: `1.21.7`):
-
-```bash
-./scripts/download-paper.sh 1.21.7
-```
-
-2. Build plugin and bot:
-
-```bash
-./scripts/gradle.sh :plugin-vocabulary-quest:build :chat-bot:installDist
-```
-
-3. Copy plugin jar into Paper:
-
-```bash
-./scripts/copy-plugin.sh
-```
-
-4. Start server:
-
-```bash
-./scripts/start-paper.sh
-```
-
-5. Start chatbot in another terminal:
-
-```bash
-./scripts/run-bot.sh --host 127.0.0.1 --port 25565 --username ChatBot
-```
-
-When connected, type normal chat lines and press Enter.  
-Type `/quit` to disconnect the bot.
-
-Plugin-originated broadcasts are emitted with chat identity `Jenkins`.
-
-## Connect From Minecraft Client
-
-- Add server: `127.0.0.1:25565`
-- This setup is local/offline (`online-mode=false` in `paper/server.properties`).
-
-## Plugin Commands
-
-Player commands:
+Player command:
 
 - `/answer <antwort>` - answer active quest
 
@@ -76,15 +23,32 @@ RCON-only admin commands:
 - `/flushanswers` - clears reward/attempt tracking tables
 - `/flushvocab <en|fr>` - clears one vocabulary table (`de_en` or `de_fr`) and resets reward/attempt tracking
 - `/addvocab <en|fr> <de_wort> <uebersetzung>` - inserts one vocabulary row
+- `/setvocaburl <en|fr> <url>` - stores sheet CSV URL in plugin config
+- `/importvocab <en|fr>` - merges one language from configured sheet URL
 
-## Vocabulary CSV Files
+## Google Sheets Import (DE->EN / DE->FR)
 
-On first plugin startup, default CSV files are copied to:
+The plugin imports from Google Sheets CSV export URLs.
 
-- `paper/plugins/VocabularyQuestPlugin/vocabulary/de_en.csv`
-- `paper/plugins/VocabularyQuestPlugin/vocabulary/de_fr.csv`
+- one URL for `en` (DE->EN)
+- one URL for `fr` (DE->FR)
+- URLs are persisted in `paper/plugins/VocabularyQuestPlugin/config.yml`
 
-Format:
+### 1) Create Google Sheets CSV export URLs
+
+Use URLs like:
+
+- `https://docs.google.com/spreadsheets/d/<sheet-id>/export?format=csv&gid=<gid-en>`
+- `https://docs.google.com/spreadsheets/d/<sheet-id>/export?format=csv&gid=<gid-fr>`
+
+You can use:
+
+- two tabs in one spreadsheet (different `gid`)
+- or two separate spreadsheets
+
+### 2) Required sheet content
+
+DE->EN sheet:
 
 ```csv
 de,en
@@ -92,55 +56,63 @@ haus,house
 baum,tree
 ```
 
+DE->FR sheet:
+
 ```csv
 de,fr
 haus,maison
 baum,arbre
 ```
 
-After editing CSV files, restart server to reload them.
+Parsing rules:
 
-## RCON Usage
+- first column is `de`, second is `en` or `fr`
+- empty lines and `#` comment lines are ignored
+- malformed rows are skipped
+- header row is optional and ignored when present
 
-RCON is enabled by default in `paper/server.properties`:
+### 3) Configure via RCON
+
+Run these commands in your RCON client:
+
+```text
+setvocaburl en https://docs.google.com/spreadsheets/d/<sheet-id>/export?format=csv&gid=<gid-en>
+setvocaburl fr https://docs.google.com/spreadsheets/d/<sheet-id>/export?format=csv&gid=<gid-fr>
+```
+
+### 4) Run import via RCON
+
+```text
+importvocab en
+importvocab fr
+```
+
+If URLs are configured, the plugin also runs one import attempt automatically on server startup.
+
+### 5) How import is handled
+
+Import is merge-only by German word (`de`, case-insensitive):
+
+- new `de` words are inserted
+- existing `de` words are kept as-is (not overwritten)
+- reward/attempt counters are preserved
+
+This keeps existing player progress valid.
+
+## RCON Basics
+
+Set these in `server.properties`:
 
 - `enable-rcon=true`
 - `rcon.port=25575`
-- `rcon.password=dev-rcon-password`
-
-Send commands:
-
-```bash
-python3 ./scripts/rcon-command.py --host 127.0.0.1 --port 25575 --password dev-rcon-password "questnow"
-python3 ./scripts/rcon-command.py --host 127.0.0.1 --port 25575 --password dev-rcon-password "flushanswers"
-python3 ./scripts/rcon-command.py --host 127.0.0.1 --port 25575 --password dev-rcon-password "flushvocab en"
-python3 ./scripts/rcon-command.py --host 127.0.0.1 --port 25575 --password dev-rcon-password "addvocab en hund dog"
-```
-
-## Automated Smoke Test (Layer 3)
-
-Runs end-to-end:
-
-- build + copy plugin
-- start Paper
-- connect ChatBot
-- trigger DB dump
-- start quest
-- answer quest using DB lookup
-- verify reward row in SQLite
-
-```bash
-./scripts/integration-smoke.sh
-```
+- `rcon.password=<your-password>`
 
 ## Useful Paths
 
-- Server log: `paper/logs/latest.log`
-- Plugin DB: `paper/plugins/VocabularyQuestPlugin/mindcraft.db`
-- Plugin config/data folder: `paper/plugins/VocabularyQuestPlugin/`
+- Plugin data folder: `plugins/VocabularyQuestPlugin/`
+- Plugin DB: `plugins/VocabularyQuestPlugin/mindcraft.db`
+- Plugin config: `plugins/VocabularyQuestPlugin/config.yml`
 
 ## License
 
 This project is licensed under `GPL-3.0`.
-
-Copyright (C) 2026 Steffen Pfendtner `<steffen@pfendtner.de>`

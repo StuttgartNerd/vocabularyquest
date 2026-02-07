@@ -19,11 +19,11 @@ import org.bukkit.scheduler.BukkitTask;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.SQLException;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -37,14 +37,22 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
     private static final String FLUSH_ANSWERS_COMMAND = "flushanswers";
     private static final String FLUSH_VOCAB_COMMAND = "flushvocab";
     private static final String ADD_VOCAB_COMMAND = "addvocab";
+    private static final String SET_VOCAB_URL_COMMAND = "setvocaburl";
+    private static final String IMPORT_VOCAB_COMMAND = "importvocab";
     private static final String ANSWER_COMMAND = "answer";
     private static final String QUEST_NOW_COMMAND = "questnow";
+    private static final String CONFIG_SHEET_URL_EN = "vocab_import.sheet_urls.en";
+    private static final String CONFIG_SHEET_URL_FR = "vocab_import.sheet_urls.fr";
+    private static final String CONFIG_HTTP_CONNECT_TIMEOUT_SECONDS = "vocab_import.http.connect_timeout_seconds";
+    private static final String CONFIG_HTTP_READ_TIMEOUT_SECONDS = "vocab_import.http.read_timeout_seconds";
     private static final long QUEST_TIMEOUT_TICKS = 2L * 60L * 20L;
     private static final int QUEST_DELAY_MIN_SECONDS = 3 * 60;
     private static final int QUEST_DELAY_MAX_SECONDS = 10 * 60;
     private static final int MIN_VOCAB_ENTRIES_FOR_TIMER_QUESTS = 10;
     private static final int MAX_ANSWER_LENGTH = 64;
     private static final int MAX_VOCAB_TERM_LENGTH = 64;
+    private static final int DEFAULT_HTTP_CONNECT_TIMEOUT_SECONDS = 10;
+    private static final int DEFAULT_HTTP_READ_TIMEOUT_SECONDS = 20;
 
     private final Random random = new Random();
     private SQLiteStore sqliteStore;
@@ -55,8 +63,12 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
     private record ActiveQuest(String vocabTable, String deWord, String answer) {
     }
 
+    private record ImportSummary(int sourceRows, int inserted, int skippedExisting) {
+    }
+
     @Override
     public void onEnable() {
+        saveDefaultConfig();
         try {
             initializeStorage();
         } catch (IOException | SQLException e) {
@@ -64,6 +76,8 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
+
+        importConfiguredSheetsOnStartup();
 
         getServer().getPluginManager().registerEvents(this, this);
         for (Player onlinePlayer : Bukkit.getOnlinePlayers()) {
@@ -206,6 +220,80 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
             return true;
         }
 
+        if (SET_VOCAB_URL_COMMAND.equalsIgnoreCase(command.getName())) {
+            if (!isRconSender(sender)) {
+                sender.sendMessage("This command is restricted to RCON.");
+                return true;
+            }
+
+            if (args.length < 2) {
+                sender.sendMessage("Usage: /setvocaburl <en|fr> <url>");
+                return true;
+            }
+
+            String language = sanitizeUserInput(args[0]).toLowerCase(Locale.ROOT);
+            if (!isSupportedImportLanguage(language)) {
+                sender.sendMessage("Language must be en or fr.");
+                return true;
+            }
+
+            String url = sanitizeUserInput(
+                    String.join(" ", java.util.Arrays.copyOfRange(args, 1, args.length))
+            );
+            if (!isValidHttpUrl(url)) {
+                sender.sendMessage("URL must be a valid http(s) URL.");
+                return true;
+            }
+
+            getConfig().set(configPathForSheetUrl(language), url);
+            saveConfig();
+
+            sender.sendMessage("Set sheet URL for de_" + language + ".");
+            getLogger().info("RCON configured sheet URL for de_" + language + ": " + url);
+            return true;
+        }
+
+        if (IMPORT_VOCAB_COMMAND.equalsIgnoreCase(command.getName())) {
+            if (!isRconSender(sender)) {
+                sender.sendMessage("This command is restricted to RCON.");
+                return true;
+            }
+
+            if (args.length != 1) {
+                sender.sendMessage("Usage: /importvocab <en|fr>");
+                return true;
+            }
+
+            String language = sanitizeUserInput(args[0]).toLowerCase(Locale.ROOT);
+            if (!isSupportedImportLanguage(language)) {
+                sender.sendMessage("Language must be en or fr.");
+                return true;
+            }
+
+            String sourceUrl = getConfiguredSheetUrl(language);
+            if (sourceUrl.isBlank()) {
+                sender.sendMessage("No sheet URL configured for de_" + language + ". Use /setvocaburl first.");
+                return true;
+            }
+
+            try {
+                ImportSummary summary = mergeVocabularyFromSheet(language, sourceUrl);
+                if (summary.sourceRows() == 0) {
+                    sender.sendMessage("Import aborted: source contains zero vocabulary entries.");
+                    return true;
+                }
+
+                sender.sendMessage("Merged de_" + language + " from sheet: added " + summary.inserted()
+                        + " new entries, skipped " + summary.skippedExisting() + " existing.");
+                getLogger().info("RCON merged de_" + language + " from sheet URL: added=" + summary.inserted()
+                        + ", skippedExisting=" + summary.skippedExisting() + ", source=" + sourceUrl);
+            } catch (IOException | SQLException e) {
+                getLogger().log(Level.SEVERE, "Failed to import de_" + language + " from sheet URL.", e);
+                sender.sendMessage("Failed to import de_" + language + ". Check server log.");
+            }
+            return true;
+        }
+
         if (ANSWER_COMMAND.equalsIgnoreCase(command.getName())) {
             if (!(sender instanceof Player player)) {
                 sender.sendMessage("Only players can answer quests.");
@@ -312,41 +400,44 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
 
     private List<SQLiteStore.VocabEntry> loadVocabularyCsv(Path csvPath, String leftHeader, String rightHeader)
             throws IOException {
-        List<SQLiteStore.VocabEntry> entries = new ArrayList<>();
+        return VocabularyCsvImport.loadFromPath(csvPath, leftHeader, rightHeader, getLogger());
+    }
 
-        try (var reader = Files.newBufferedReader(csvPath, StandardCharsets.UTF_8)) {
-            String line;
-            int lineNo = 0;
-            while ((line = reader.readLine()) != null) {
-                lineNo++;
-                String trimmed = line.trim();
+    private List<SQLiteStore.VocabEntry> loadVocabularyCsvFromUrl(String sourceUrl, String leftHeader,
+                                                                   String rightHeader) throws IOException {
+        int connectTimeoutSeconds = Math.max(1,
+                getConfig().getInt(CONFIG_HTTP_CONNECT_TIMEOUT_SECONDS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECONDS));
+        int readTimeoutSeconds = Math.max(1,
+                getConfig().getInt(CONFIG_HTTP_READ_TIMEOUT_SECONDS, DEFAULT_HTTP_READ_TIMEOUT_SECONDS));
+        return VocabularyCsvImport.loadFromUrl(sourceUrl, connectTimeoutSeconds, readTimeoutSeconds, leftHeader,
+                rightHeader, getLogger());
+    }
 
-                if (trimmed.isEmpty() || trimmed.startsWith("#")) {
-                    continue;
-                }
+    private ImportSummary mergeVocabularyFromSheet(String language, String sourceUrl) throws IOException, SQLException {
+        List<SQLiteStore.VocabEntry> entries = loadVocabularyCsvFromUrl(sourceUrl, "de", language);
+        int inserted = sqliteStore.insertMissingVocabularyEntries(language, entries);
+        int skippedExisting = entries.size() - inserted;
+        return new ImportSummary(entries.size(), inserted, skippedExisting);
+    }
 
-                String[] parts = trimmed.split(",", 2);
-                if (parts.length < 2) {
-                    getLogger().warning("Skipping malformed CSV row in " + csvPath.getFileName() + ":" + lineNo);
-                    continue;
-                }
+    private void importConfiguredSheetsOnStartup() {
+        importConfiguredSheetOnStartup("en");
+        importConfiguredSheetOnStartup("fr");
+    }
 
-                String left = parts[0].trim();
-                String right = parts[1].trim();
-                if (left.isEmpty() || right.isEmpty()) {
-                    getLogger().warning("Skipping empty CSV row in " + csvPath.getFileName() + ":" + lineNo);
-                    continue;
-                }
-
-                if (left.equalsIgnoreCase(leftHeader) && right.equalsIgnoreCase(rightHeader)) {
-                    continue;
-                }
-
-                entries.add(new SQLiteStore.VocabEntry(left, right));
-            }
+    private void importConfiguredSheetOnStartup(String language) {
+        String sourceUrl = getConfiguredSheetUrl(language);
+        if (sourceUrl.isBlank()) {
+            return;
         }
 
-        return entries;
+        try {
+            ImportSummary summary = mergeVocabularyFromSheet(language, sourceUrl);
+            getLogger().info("Startup sheet merge for de_" + language + ": sourceRows=" + summary.sourceRows()
+                    + ", added=" + summary.inserted() + ", skippedExisting=" + summary.skippedExisting());
+        } catch (IOException | SQLException e) {
+            getLogger().log(Level.WARNING, "Startup sheet merge failed for de_" + language + ".", e);
+        }
     }
 
     private void ensureDefaultResource(String resourcePath, Path targetPath) throws IOException {
@@ -636,5 +727,34 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
 
     private boolean isRconSender(CommandSender sender) {
         return sender instanceof RemoteConsoleCommandSender;
+    }
+
+    private String getConfiguredSheetUrl(String language) {
+        return getConfig().getString(configPathForSheetUrl(language), "").trim();
+    }
+
+    private String configPathForSheetUrl(String language) {
+        return "en".equals(language) ? CONFIG_SHEET_URL_EN : CONFIG_SHEET_URL_FR;
+    }
+
+    private boolean isSupportedImportLanguage(String language) {
+        return "en".equals(language) || "fr".equals(language);
+    }
+
+    private boolean isValidHttpUrl(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+
+        try {
+            URI uri = new URI(value.trim());
+            String scheme = uri.getScheme();
+            if (scheme == null) {
+                return false;
+            }
+            return "http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme);
+        } catch (URISyntaxException e) {
+            return false;
+        }
     }
 }

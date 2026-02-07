@@ -4,6 +4,8 @@ import be.seeseemelk.mockbukkit.MockBukkit;
 import be.seeseemelk.mockbukkit.ServerMock;
 import be.seeseemelk.mockbukkit.command.CommandResult;
 import be.seeseemelk.mockbukkit.entity.PlayerMock;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
 import org.bukkit.Material;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.command.RemoteConsoleCommandSender;
@@ -16,6 +18,13 @@ import org.junit.jupiter.api.Test;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -58,6 +67,12 @@ class VocabularyQuestPluginMockBukkitTest {
         CommandResult playerQuestResult = server.executePlayer("questnow");
         playerQuestResult.assertResponse("This command is restricted to RCON.");
 
+        CommandResult playerSetUrlResult = server.executePlayer("setvocaburl", "en", "https://example.test/en.csv");
+        playerSetUrlResult.assertResponse("This command is restricted to RCON.");
+
+        CommandResult playerImportResult = server.executePlayer("importvocab", "en");
+        playerImportResult.assertResponse("This command is restricted to RCON.");
+
         CommandResult consoleDumpResult = server.executeConsole("dbdump");
         consoleDumpResult.assertResponse("This command is restricted to RCON.");
 
@@ -69,6 +84,13 @@ class VocabularyQuestPluginMockBukkitTest {
 
         CommandResult consoleQuestResult = server.executeConsole("questnow");
         consoleQuestResult.assertResponse("This command is restricted to RCON.");
+
+        CommandResult consoleSetUrlResult = server.executeConsole(
+                "setvocaburl", "en", "https://example.test/en.csv");
+        consoleSetUrlResult.assertResponse("This command is restricted to RCON.");
+
+        CommandResult consoleImportResult = server.executeConsole("importvocab", "en");
+        consoleImportResult.assertResponse("This command is restricted to RCON.");
     }
 
     @Test
@@ -92,9 +114,21 @@ class VocabularyQuestPluginMockBukkitTest {
         assertNotNull(addVocab);
         assertTrue(plugin.onCommand(rcon, addVocab, "addvocab", new String[]{"en", "hund", "dog"}));
 
+        PluginCommand setVocabUrl = server.getPluginCommand("setvocaburl");
+        assertNotNull(setVocabUrl);
+        String configuredEnUrl = "https://example.test/en.csv";
+        assertTrue(plugin.onCommand(rcon, setVocabUrl, "setvocaburl", new String[]{"en", configuredEnUrl}));
+        assertEquals(configuredEnUrl, plugin.getConfig().getString("vocab_import.sheet_urls.en"));
+
+        PluginCommand importVocab = server.getPluginCommand("importvocab");
+        assertNotNull(importVocab);
+        assertTrue(plugin.onCommand(rcon, importVocab, "importvocab", new String[]{"fr"}));
+
         SQLiteStore.DumpSummary afterInsert = store.dumpToLog(java.util.logging.Logger.getLogger("test"));
         assertEquals(deEnBefore + 1, afterInsert.deEnEntries());
         assertTrue(messages.stream().anyMatch(m -> m.contains("Inserted vocabulary pair")));
+        assertTrue(messages.stream().anyMatch(m -> m.contains("Set sheet URL for de_en.")));
+        assertTrue(messages.stream().anyMatch(m -> m.contains("No sheet URL configured for de_fr")));
 
         PluginCommand flushAnswers = server.getPluginCommand("flushanswers");
         assertNotNull(flushAnswers);
@@ -250,6 +284,102 @@ class VocabularyQuestPluginMockBukkitTest {
         assertTrue(rconMessages.stream().anyMatch(m -> m.contains("Vocabulary terms must be <= 64 characters.")));
     }
 
+    @Test
+    void importVocabPullsConfiguredSheetUrlsForEnAndFr() throws Exception {
+        SQLiteStore store = getSQLiteStore();
+        store.replaceDeEn(List.of(new SQLiteStore.VocabEntry("haus", "legacy-house")));
+        store.replaceDeFr(List.of(new SQLiteStore.VocabEntry("haus", "ancienne-maison")));
+        store.recordAttempt("alice", "de_en", "haus", false);
+        store.recordAttempt("alice", "de_fr", "haus", false);
+
+        HttpServer httpServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        try {
+            httpServer.createContext("/de_en.csv", exchange -> respondCsv(exchange, """
+                    de,en
+                    haus,new-house
+                    baum,tree
+                    """));
+            httpServer.createContext("/de_fr.csv", exchange -> respondCsv(exchange, """
+                    de,fr
+                    haus,nouvelle-maison
+                    baum,arbre
+                    """));
+            httpServer.start();
+
+            int port = httpServer.getAddress().getPort();
+            String enUrl = "http://127.0.0.1:" + port + "/de_en.csv";
+            String frUrl = "http://127.0.0.1:" + port + "/de_fr.csv";
+
+            List<String> messages = new ArrayList<>();
+            RemoteConsoleCommandSender rcon = createRconSender(messages);
+
+            PluginCommand setVocabUrl = server.getPluginCommand("setvocaburl");
+            assertNotNull(setVocabUrl);
+            assertTrue(plugin.onCommand(rcon, setVocabUrl, "setvocaburl", new String[]{"en", enUrl}));
+            assertTrue(plugin.onCommand(rcon, setVocabUrl, "setvocaburl", new String[]{"fr", frUrl}));
+
+            PluginCommand importVocab = server.getPluginCommand("importvocab");
+            assertNotNull(importVocab);
+            assertTrue(plugin.onCommand(rcon, importVocab, "importvocab", new String[]{"en"}));
+            assertTrue(plugin.onCommand(rcon, importVocab, "importvocab", new String[]{"fr"}));
+
+            SQLiteStore.DumpSummary summary = store.dumpToLog(java.util.logging.Logger.getLogger("test"));
+            assertEquals(2, summary.deEnEntries());
+            assertEquals(2, summary.deFrEntries());
+            assertEquals(2, summary.attempts(), "Merge import must not clear attempt counters.");
+            assertTrue(messages.stream().anyMatch(m -> m.contains("Merged de_en from sheet: added 1 new entries")));
+            assertTrue(messages.stream().anyMatch(m -> m.contains("Merged de_fr from sheet: added 1 new entries")));
+
+            Path dbPath = plugin.getDataFolder().toPath().resolve("mindcraft.db");
+            assertEquals("legacy-house", selectTranslation(dbPath, "vocab_de_en", "en", "haus"));
+            assertEquals("tree", selectTranslation(dbPath, "vocab_de_en", "en", "baum"));
+            assertEquals("ancienne-maison", selectTranslation(dbPath, "vocab_de_fr", "fr", "haus"));
+            assertEquals("arbre", selectTranslation(dbPath, "vocab_de_fr", "fr", "baum"));
+        } finally {
+            httpServer.stop(0);
+        }
+    }
+
+    @Test
+    void startupImportMergesConfiguredSheetsWhenUrlsExist() throws Exception {
+        SQLiteStore store = getSQLiteStore();
+        store.replaceDeEn(List.of(new SQLiteStore.VocabEntry("haus", "legacy-house")));
+        store.replaceDeFr(List.of(new SQLiteStore.VocabEntry("haus", "ancienne-maison")));
+
+        HttpServer httpServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        try {
+            httpServer.createContext("/startup-en.csv", exchange -> respondCsv(exchange, """
+                    de,en
+                    haus,new-house
+                    baum,tree
+                    """));
+            httpServer.createContext("/startup-fr.csv", exchange -> respondCsv(exchange, """
+                    de,fr
+                    haus,nouvelle-maison
+                    baum,arbre
+                    """));
+            httpServer.start();
+
+            int port = httpServer.getAddress().getPort();
+            plugin.getConfig().set("vocab_import.sheet_urls.en", "http://127.0.0.1:" + port + "/startup-en.csv");
+            plugin.getConfig().set("vocab_import.sheet_urls.fr", "http://127.0.0.1:" + port + "/startup-fr.csv");
+
+            invokeImportConfiguredSheetsOnStartup();
+
+            SQLiteStore.DumpSummary summary = store.dumpToLog(java.util.logging.Logger.getLogger("test"));
+            assertEquals(2, summary.deEnEntries());
+            assertEquals(2, summary.deFrEntries());
+
+            Path dbPath = plugin.getDataFolder().toPath().resolve("mindcraft.db");
+            assertEquals("legacy-house", selectTranslation(dbPath, "vocab_de_en", "en", "haus"));
+            assertEquals("tree", selectTranslation(dbPath, "vocab_de_en", "en", "baum"));
+            assertEquals("ancienne-maison", selectTranslation(dbPath, "vocab_de_fr", "fr", "haus"));
+            assertEquals("arbre", selectTranslation(dbPath, "vocab_de_fr", "fr", "baum"));
+        } finally {
+            httpServer.stop(0);
+        }
+    }
+
     private RemoteConsoleCommandSender createRconSender(List<String> sink) {
         return (RemoteConsoleCommandSender) Proxy.newProxyInstance(
                 RemoteConsoleCommandSender.class.getClassLoader(),
@@ -316,6 +446,12 @@ class VocabularyQuestPluginMockBukkitTest {
         return (boolean) method.invoke(plugin, timerTriggered);
     }
 
+    private void invokeImportConfiguredSheetsOnStartup() throws Exception {
+        Method method = VocabularyQuestPlugin.class.getDeclaredMethod("importConfiguredSheetsOnStartup");
+        method.setAccessible(true);
+        method.invoke(plugin);
+    }
+
     private int countMaterial(PlayerMock player, Material material) {
         return player.getInventory().all(material)
                 .values()
@@ -366,5 +502,25 @@ class VocabularyQuestPluginMockBukkitTest {
             return '\0';
         }
         return null;
+    }
+
+    private void respondCsv(HttpExchange exchange, String body) throws java.io.IOException {
+        byte[] payload = body.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "text/csv; charset=utf-8");
+        exchange.sendResponseHeaders(200, payload.length);
+        try (var out = exchange.getResponseBody()) {
+            out.write(payload);
+        }
+    }
+
+    private String selectTranslation(Path dbPath, String table, String column, String deWord) throws Exception {
+        try (Connection connection = DriverManager.getConnection("jdbc:sqlite:" + dbPath.toAbsolutePath());
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT " + column + " FROM " + table + " WHERE lower(de)=lower(?) ORDER BY id ASC LIMIT 1")) {
+            statement.setString(1, deWord);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                return resultSet.next() ? resultSet.getString(column) : null;
+            }
+        }
     }
 }

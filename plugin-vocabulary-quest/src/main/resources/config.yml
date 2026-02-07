@@ -1,0 +1,7 @@
+vocab_import:
+  sheet_urls:
+    en: ""
+    fr: ""
+  http:
+    connect_timeout_seconds: 10
+    read_timeout_seconds: 20

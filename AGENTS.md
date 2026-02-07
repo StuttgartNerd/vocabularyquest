@@ -22,6 +22,8 @@ Main class: `plugin-vocabulary-quest/src/main/java/io/github/stuttgartnerd/vocab
 Responsibilities:
 - Track joined users in SQLite
 - Load DE->EN / DE->FR vocab from CSV on startup
+- Optionally import DE->EN / DE->FR vocab from Google Sheets CSV URLs via RCON
+- If sheet URLs are configured, attempt one EN/FR sheet merge on startup
 - Schedule vocabulary quests at random intervals (3-10 minutes)
 - Evaluate answers and grant one emerald for first correct answer per player+word
 - Expose RCON-only admin/testing commands
@@ -29,6 +31,9 @@ Responsibilities:
 
 ### Storage Layer
 Class: `plugin-vocabulary-quest/src/main/java/io/github/stuttgartnerd/vocabularyquest/SQLiteStore.java`
+
+CSV import utility class:
+- `plugin-vocabulary-quest/src/main/java/io/github/stuttgartnerd/vocabularyquest/VocabularyCsvImport.java`
 
 SQLite DB path:
 - `paper/plugins/VocabularyQuestPlugin/mindcraft.db`
@@ -39,6 +44,12 @@ Tables:
 - `vocab_de_fr`
 - `player_vocab_rewards`
 - `vocab_attempts`
+
+Sheet import semantics:
+- `/importvocab <en|fr>` is merge-only (append missing entries by `de`, case-insensitive)
+- Existing `de` entries are not overwritten
+- Reward/attempt counters remain unchanged
+- Startup performs at most one merge attempt per configured language (`en`, `fr`)
 
 Quest selection:
 - Only entries reward-eligible for online players are considered
@@ -56,12 +67,15 @@ Used for:
 ### Player-facing
 - `/answer <antwort>`
 - `/msg jenkins <antwort>` (also supports aliases handled in parser)
-- `/questnow` (currently callable in-game/console)
 
 ### RCON-only
+- `/questnow`
 - `/dbdump`
 - `/flushanswers`
+- `/flushvocab <en|fr>`
 - `/addvocab <en|fr> <de_wort> <uebersetzung>`
+- `/setvocaburl <en|fr> <url>`
+- `/importvocab <en|fr>`
 
 ## Jenkins Chat Identity
 Plugin broadcasts are formatted as:
@@ -88,18 +102,29 @@ Common commands:
 ./scripts/run-bot.sh --host 127.0.0.1 --port 25565 --username ChatBot
 ```
 
+Sheet import config (persisted in plugin data folder):
+- `paper/plugins/VocabularyQuestPlugin/config.yml`
+- keys:
+  - `vocab_import.sheet_urls.en`
+  - `vocab_import.sheet_urls.fr`
+  - `vocab_import.http.connect_timeout_seconds`
+  - `vocab_import.http.read_timeout_seconds`
+
 ## Testing Stages
 ### Stage 1: Unit (fast)
 - File: `plugin-vocabulary-quest/src/test/java/io/github/stuttgartnerd/vocabularyquest/SQLiteStoreTest.java`
-- Focus: schema, CRUD, reward/attempt tracking, weighted selection
+- File: `plugin-vocabulary-quest/src/test/java/io/github/stuttgartnerd/vocabularyquest/VocabularyCsvImportTest.java`
+- Focus: schema/CRUD, reward/attempt tracking, weighted selection, merge-import semantics, HTTP CSV parsing
 
 ### Stage 2: Plugin-level (MockBukkit)
 - File: `plugin-vocabulary-quest/src/test/java/io/github/stuttgartnerd/vocabularyquest/VocabularyQuestPluginMockBukkitTest.java`
-- Focus: command permissions, join event insert, quest+answer flow
+- Focus: command permissions, join event insert, quest+answer flow, `/setvocaburl` + `/importvocab` behavior
 
 ### Stage 3: Integration smoke (Paper runtime)
 - Script: `scripts/integration-smoke.sh`
-- Flow: build -> start Paper -> connect bot -> DB dump -> questnow -> bot answer -> DB assert
+- Flow: build -> start Paper -> start local Python CSV fixture server (high port) ->
+  set sheet URLs via RCON -> import EN/FR via RCON (merge assertions in SQLite) ->
+  connect bot -> DB dump -> questnow -> bot answer -> DB assert
 - Auto-bootstrap: if `paper/paper.jar` is missing, script calls `download-paper.sh` automatically
 
 ## CI/Automation Commands
@@ -116,7 +141,9 @@ Common commands:
 ## High-Value Files
 - `plugin-vocabulary-quest/src/main/java/io/github/stuttgartnerd/vocabularyquest/VocabularyQuestPlugin.java`
 - `plugin-vocabulary-quest/src/main/java/io/github/stuttgartnerd/vocabularyquest/SQLiteStore.java`
+- `plugin-vocabulary-quest/src/main/java/io/github/stuttgartnerd/vocabularyquest/VocabularyCsvImport.java`
 - `plugin-vocabulary-quest/src/main/resources/plugin.yml`
+- `plugin-vocabulary-quest/src/main/resources/config.yml`
 - `chat-bot/src/main/java/dev/snpr/chatbot/TestChatBot.java`
 - `scripts/integration-smoke.sh`
 - `scripts/rcon-command.py`

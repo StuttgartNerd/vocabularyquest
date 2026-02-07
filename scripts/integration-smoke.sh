@@ -9,15 +9,27 @@ RCON_HOST="${RCON_HOST:-127.0.0.1}"
 RCON_PORT="${RCON_PORT:-25575}"
 RCON_PASSWORD="${RCON_PASSWORD:-dev-rcon-password}"
 SMOKE_MC_VERSION="${SMOKE_MC_VERSION:-1.21.7}"
+SHEET_HTTP_PORT="${SHEET_HTTP_PORT:-38080}"
+SMOKE_RUN_ID="${SMOKE_RUN_ID:-$(date +%s%N)}"
+SMOKE_KEEP_DE_WORD="smoke_keep_${SMOKE_RUN_ID}"
+SMOKE_KEEP_EN_VALUE="keep_en_${SMOKE_RUN_ID}"
+SMOKE_KEEP_FR_VALUE="keep_fr_${SMOKE_RUN_ID}"
+SMOKE_NEW_EN_DE_WORD="smoke_new_en_${SMOKE_RUN_ID}"
+SMOKE_NEW_EN_VALUE="new_en_${SMOKE_RUN_ID}"
+SMOKE_NEW_FR_DE_WORD="smoke_new_fr_${SMOKE_RUN_ID}"
+SMOKE_NEW_FR_VALUE="new_fr_${SMOKE_RUN_ID}"
 
 SERVER_LOG="$ROOT_DIR/paper/logs/latest.log"
 DB_PATH="$ROOT_DIR/paper/plugins/VocabularyQuestPlugin/mindcraft.db"
 WORK_DIR="$(mktemp -d /tmp/mindcraft-smoke-XXXXXX)"
 SERVER_STDOUT="$WORK_DIR/server.out"
 BOT_LOG="$WORK_DIR/bot.log"
+SHEET_SERVER_LOG="$WORK_DIR/sheet-server.log"
+SHEET_DIR="$WORK_DIR/sheet-fixture"
 
 SERVER_PID=""
 BOT_PID=""
+SHEET_SERVER_PID=""
 
 rcon_cmd() {
   "$ROOT_DIR/scripts/rcon-command.py" \
@@ -35,10 +47,19 @@ stop_bot_process() {
   BOT_PID=""
 }
 
+stop_sheet_server() {
+  if [[ -n "$SHEET_SERVER_PID" ]] && kill -0 "$SHEET_SERVER_PID" >/dev/null 2>&1; then
+    kill "$SHEET_SERVER_PID" >/dev/null 2>&1 || true
+    wait "$SHEET_SERVER_PID" >/dev/null 2>&1 || true
+  fi
+  SHEET_SERVER_PID=""
+}
+
 cleanup() {
   set +e
 
   stop_bot_process
+  stop_sheet_server
 
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
     rcon_cmd "stop" >/dev/null 2>&1 || true
@@ -100,6 +121,21 @@ wait_for_player_online() {
   return 1
 }
 
+wait_for_rcon_ready() {
+  local timeout_seconds="$1"
+  local waited=0
+
+  while (( waited < timeout_seconds )); do
+    if rcon_cmd "list" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    ((waited+=1))
+  done
+
+  return 1
+}
+
 start_bot_process() {
   local send_on_connect="${1:-}"
   local send_delay_ms="${2:-0}"
@@ -124,8 +160,42 @@ start_bot_process() {
   BOT_PID="$!"
 }
 
+start_sheet_fixture_server() {
+  mkdir -p "$SHEET_DIR"
+  cat >"$SHEET_DIR/de_en.csv" <<CSV
+de,en
+${SMOKE_KEEP_DE_WORD},should_not_overwrite_en
+${SMOKE_NEW_EN_DE_WORD},${SMOKE_NEW_EN_VALUE}
+CSV
+  cat >"$SHEET_DIR/de_fr.csv" <<CSV
+de,fr
+${SMOKE_KEEP_DE_WORD},should_not_overwrite_fr
+${SMOKE_NEW_FR_DE_WORD},${SMOKE_NEW_FR_VALUE}
+CSV
+
+  python3 -m http.server "$SHEET_HTTP_PORT" --bind 127.0.0.1 --directory "$SHEET_DIR" >"$SHEET_SERVER_LOG" 2>&1 &
+  SHEET_SERVER_PID="$!"
+
+  local waited=0
+  while (( waited < 20 )); do
+    if curl -fsS "http://127.0.0.1:${SHEET_HTTP_PORT}/de_en.csv" >/dev/null 2>&1 \
+      && curl -fsS "http://127.0.0.1:${SHEET_HTTP_PORT}/de_fr.csv" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    ((waited+=1))
+  done
+
+  return 1
+}
+
 if ss -lnt | rg -q "[:.]${MC_PORT}[[:space:]]"; then
   echo "Port ${MC_PORT} is already in use. Stop existing server first."
+  exit 1
+fi
+
+if ss -lnt | rg -q "[:.]${SHEET_HTTP_PORT}[[:space:]]"; then
+  echo "Port ${SHEET_HTTP_PORT} is already in use. Set SHEET_HTTP_PORT to a free high port."
   exit 1
 fi
 
@@ -153,6 +223,98 @@ wait_for_log_line "RCON running on" 60 || {
   tail -n 200 "$SERVER_STDOUT" || true
   exit 1
 }
+
+wait_for_rcon_ready 30 || {
+  echo "[smoke] RCON socket did not become ready."
+  tail -n 200 "$SERVER_STDOUT" || true
+  exit 1
+}
+
+echo "[smoke] Starting local sheet fixture server on port ${SHEET_HTTP_PORT}..."
+start_sheet_fixture_server || {
+  echo "[smoke] Sheet fixture server failed to start."
+  tail -n 200 "$SHEET_SERVER_LOG" || true
+  exit 1
+}
+
+echo "[smoke] Importing EN/FR vocab from sheet URLs via RCON..."
+rcon_cmd "addvocab en ${SMOKE_KEEP_DE_WORD} ${SMOKE_KEEP_EN_VALUE}" >/dev/null
+rcon_cmd "addvocab fr ${SMOKE_KEEP_DE_WORD} ${SMOKE_KEEP_FR_VALUE}" >/dev/null
+
+counts_before="$(
+  python3 - "$DB_PATH" <<'PY'
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+cur.execute("SELECT COUNT(*) FROM vocab_de_en")
+en_count = cur.fetchone()[0]
+cur.execute("SELECT COUNT(*) FROM vocab_de_fr")
+fr_count = cur.fetchone()[0]
+conn.close()
+print(f"{en_count} {fr_count}")
+PY
+)"
+read -r en_count_before fr_count_before <<<"$counts_before"
+
+rcon_cmd "setvocaburl en http://127.0.0.1:${SHEET_HTTP_PORT}/de_en.csv" >/dev/null
+rcon_cmd "setvocaburl fr http://127.0.0.1:${SHEET_HTTP_PORT}/de_fr.csv" >/dev/null
+rcon_cmd "importvocab en" >/dev/null
+rcon_cmd "importvocab fr" >/dev/null
+
+python3 - "$DB_PATH" "$en_count_before" "$fr_count_before" \
+  "$SMOKE_KEEP_DE_WORD" "$SMOKE_KEEP_EN_VALUE" "$SMOKE_KEEP_FR_VALUE" \
+  "$SMOKE_NEW_EN_DE_WORD" "$SMOKE_NEW_EN_VALUE" "$SMOKE_NEW_FR_DE_WORD" "$SMOKE_NEW_FR_VALUE" <<'PY'
+import sqlite3
+import sys
+
+(
+    db_path,
+    en_count_before,
+    fr_count_before,
+    keep_de_word,
+    keep_en_value,
+    keep_fr_value,
+    new_en_de_word,
+    new_en_value,
+    new_fr_de_word,
+    new_fr_value,
+) = sys.argv[1:]
+
+en_count_before = int(en_count_before)
+fr_count_before = int(fr_count_before)
+
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+cur.execute("SELECT COUNT(*) FROM vocab_de_en")
+en_count = cur.fetchone()[0]
+cur.execute("SELECT COUNT(*) FROM vocab_de_fr")
+fr_count = cur.fetchone()[0]
+cur.execute("SELECT en FROM vocab_de_en WHERE lower(de)=lower(?) ORDER BY id ASC LIMIT 1", (keep_de_word,))
+keep_en_row = cur.fetchone()
+cur.execute("SELECT fr FROM vocab_de_fr WHERE lower(de)=lower(?) ORDER BY id ASC LIMIT 1", (keep_de_word,))
+keep_fr_row = cur.fetchone()
+cur.execute("SELECT en FROM vocab_de_en WHERE lower(de)=lower(?) LIMIT 1", (new_en_de_word,))
+new_en_row = cur.fetchone()
+cur.execute("SELECT fr FROM vocab_de_fr WHERE lower(de)=lower(?) LIMIT 1", (new_fr_de_word,))
+new_fr_row = cur.fetchone()
+conn.close()
+
+if en_count != en_count_before + 1:
+    raise SystemExit(f"Expected EN count to increase by 1, before={en_count_before}, after={en_count}")
+if fr_count != fr_count_before + 1:
+    raise SystemExit(f"Expected FR count to increase by 1, before={fr_count_before}, after={fr_count}")
+if keep_en_row is None or keep_en_row[0] != keep_en_value:
+    raise SystemExit("Expected existing EN value to remain unchanged after import merge")
+if keep_fr_row is None or keep_fr_row[0] != keep_fr_value:
+    raise SystemExit("Expected existing FR value to remain unchanged after import merge")
+if new_en_row is None or new_en_row[0] != new_en_value:
+    raise SystemExit("Expected new EN sheet entry to be inserted")
+if new_fr_row is None or new_fr_row[0] != new_fr_value:
+    raise SystemExit("Expected new FR sheet entry to be inserted")
+PY
 
 waited=0
 while (( waited < 30 )); do

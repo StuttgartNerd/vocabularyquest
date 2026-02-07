@@ -173,6 +173,48 @@ final class SQLiteStore implements AutoCloseable {
         }
     }
 
+    synchronized int insertMissingVocabularyEntries(String language, List<VocabEntry> entries) throws SQLException {
+        String normalizedLang = language == null ? "" : language.trim().toLowerCase();
+        String table;
+        String rightColumn;
+
+        if ("en".equals(normalizedLang)) {
+            table = "vocab_de_en";
+            rightColumn = "en";
+        } else if ("fr".equals(normalizedLang)) {
+            table = "vocab_de_fr";
+            rightColumn = "fr";
+        } else {
+            throw new SQLException("Unsupported language for vocabulary merge import: " + language);
+        }
+
+        if (entries == null || entries.isEmpty()) {
+            return 0;
+        }
+
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+
+        String sql = "INSERT INTO " + table + " (de, " + rightColumn + ") "
+                + "SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM " + table + " WHERE lower(de)=lower(?))";
+        int inserted = 0;
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            for (VocabEntry entry : entries) {
+                statement.setString(1, entry.left());
+                statement.setString(2, entry.right());
+                statement.setString(3, entry.left());
+                inserted += statement.executeUpdate();
+            }
+            connection.commit();
+            return inserted;
+        } catch (SQLException e) {
+            connection.rollback();
+            throw e;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
     synchronized int totalVocabularyEntries() throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement("""
                 SELECT

@@ -23,3 +23,9 @@ commands:
   addvocab:
     description: RCON only, inserts a de-en or de-fr vocabulary pair
     usage: /addvocab <en|fr> <de_wort> <uebersetzung>
+  setvocaburl:
+    description: RCON only, sets the sheet CSV URL for de-en or de-fr import
+    usage: /setvocaburl <en|fr> <url>
+  importvocab:
+    description: RCON only, merges de-en or de-fr vocabulary from configured sheet URL
+    usage: /importvocab <en|fr>
