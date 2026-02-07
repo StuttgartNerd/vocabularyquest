@@ -1,0 +1,22 @@
+name: VocabularyQuestPlugin
+version: ${version}
+main: io.github.stuttgartnerd.vocabularyquest.VocabularyQuestPlugin
+api-version: '1.21'
+libraries:
+  - org.xerial:sqlite-jdbc:3.45.3.0
+commands:
+  dbdump:
+    description: RCON only, dumps SQLite users and vocabulary tables to server log
+    usage: /dbdump
+  answer:
+    description: Answers the active vocabulary quest
+    usage: /answer <Antwort>
+  questnow:
+    description: Starts a vocabulary quest immediately
+    usage: /questnow
+  flushanswers:
+    description: RCON only, clears reward and attempt tracking tables
+    usage: /flushanswers
+  addvocab:
+    description: RCON only, inserts a de-en or de-fr vocabulary pair
+    usage: /addvocab <en|fr> <de_wort> <uebersetzung>

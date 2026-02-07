@@ -1,0 +1,4 @@
+rootProject.name = 'mincraft-trainer'
+
+include('plugin-vocabulary-quest')
+include('chat-bot')

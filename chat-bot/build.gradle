@@ -1,0 +1,12 @@
+plugins {
+    id 'application'
+}
+
+dependencies {
+    implementation 'org.geysermc.mcprotocollib:protocol:1.21.7-1'
+    runtimeOnly 'org.slf4j:slf4j-simple:2.0.16'
+}
+
+application {
+    mainClass = 'dev.snpr.chatbot.TestChatBot'
+}
