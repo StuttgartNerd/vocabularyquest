@@ -41,6 +41,8 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
     private static final long QUEST_TIMEOUT_TICKS = 2L * 60L * 20L;
     private static final int QUEST_DELAY_MIN_SECONDS = 3 * 60;
     private static final int QUEST_DELAY_MAX_SECONDS = 10 * 60;
+    private static final int MAX_ANSWER_LENGTH = 64;
+    private static final int MAX_VOCAB_TERM_LENGTH = 64;
 
     private final Random random = new Random();
     private SQLiteStore sqliteStore;
@@ -137,12 +139,19 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
                 return true;
             }
 
-            String language = args[0].trim().toLowerCase(Locale.ROOT);
-            String deWord = args[1].trim();
-            String translatedWord = String.join(" ", java.util.Arrays.copyOfRange(args, 2, args.length)).trim();
+            String language = sanitizeUserInput(args[0]).toLowerCase(Locale.ROOT);
+            String deWord = sanitizeUserInput(args[1]);
+            String translatedWord = sanitizeUserInput(
+                    String.join(" ", java.util.Arrays.copyOfRange(args, 2, args.length))
+            );
 
             if (deWord.isEmpty() || translatedWord.isEmpty()) {
                 sender.sendMessage("Both source and target words are required.");
+                return true;
+            }
+
+            if (deWord.length() > MAX_VOCAB_TERM_LENGTH || translatedWord.length() > MAX_VOCAB_TERM_LENGTH) {
+                sender.sendMessage("Vocabulary terms must be <= " + MAX_VOCAB_TERM_LENGTH + " characters.");
                 return true;
             }
 
@@ -176,11 +185,22 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
                 return true;
             }
 
-            handleQuestAnswer(player, String.join(" ", args));
+            String answer = sanitizeUserInput(String.join(" ", args));
+            if (answer.length() > MAX_ANSWER_LENGTH) {
+                player.sendMessage("Antwort ist zu lang (max " + MAX_ANSWER_LENGTH + " Zeichen).");
+                return true;
+            }
+
+            handleQuestAnswer(player, answer);
             return true;
         }
 
         if (QUEST_NOW_COMMAND.equalsIgnoreCase(command.getName())) {
+            if (!isRconSender(sender)) {
+                sender.sendMessage("This command is restricted to RCON.");
+                return true;
+            }
+
             boolean started = startVocabularyQuest();
             if (started) {
                 sender.sendMessage("Vokabel-Quest wurde gestartet.");
@@ -222,12 +242,18 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
         }
 
         event.setCancelled(true);
-        if (answer.isBlank()) {
+        String sanitizedAnswer = sanitizeUserInput(answer);
+        if (sanitizedAnswer.isBlank()) {
             event.getPlayer().sendMessage("Nutze: /msg jenkins <Antwort>");
             return;
         }
 
-        handleQuestAnswer(event.getPlayer(), answer);
+        if (sanitizedAnswer.length() > MAX_ANSWER_LENGTH) {
+            event.getPlayer().sendMessage("Antwort ist zu lang (max " + MAX_ANSWER_LENGTH + " Zeichen).");
+            return;
+        }
+
+        handleQuestAnswer(event.getPlayer(), sanitizedAnswer);
     }
 
     private void initializeStorage() throws IOException, SQLException {
@@ -521,6 +547,22 @@ public class VocabularyQuestPlugin extends JavaPlugin implements Listener {
         }
 
         return answer.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private String sanitizeUserInput(String input) {
+        if (input == null) {
+            return "";
+        }
+
+        StringBuilder builder = new StringBuilder(input.length());
+        for (int i = 0; i < input.length(); i++) {
+            char c = input.charAt(i);
+            if (!Character.isISOControl(c)) {
+                builder.append(c);
+            }
+        }
+
+        return builder.toString().trim();
     }
 
     private String formatDumpSummary(SQLiteStore.DumpSummary summary) {

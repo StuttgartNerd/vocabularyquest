@@ -1,118 +1,122 @@
 # AGENTS.md
 
-## Goal
-Run a local Minecraft Paper server and Java chatbot, verify end-to-end chat delivery, and iterate on the vocabulary-quest plugin with testable workflows.
+## Project Snapshot
+Minecraft Paper plugin project with a Java chatbot test client.
 
-## Version Compatibility
-- Use Paper `1.21.7` with chat-bot dependency `org.geysermc.mcprotocollib:protocol:1.21.7-1`.
-- If Paper is older (for example `1.21.4`), the bot disconnects with an outdated-server error.
+- Plugin module: `plugin-vocabulary-quest`
+- Plugin name: `VocabularyQuestPlugin`
+- Plugin Java package: `io.github.stuttgartnerd.vocabularyquest`
+- Chatbot module: `chat-bot`
+- Target Paper version: `1.21.7`
 
-## Tasks
-1. Download Paper and prepare local server files.
-2. Build and copy the plugin into `paper/plugins`.
-3. Start the Paper server and validate plugin startup.
-4. Run the MCProtocolLib bot and test chat send/receive.
-5. Validate SQLite-backed features (users, vocabulary, quest rewards).
-6. Add automated tests in 3 layers (unit, plugin-level, integration smoke).
+## Repository Structure
+- `plugin-vocabulary-quest/`: Paper plugin source, tests, resources
+- `chat-bot/`: MCProtocolLib chatbot used for automated interaction testing
+- `scripts/`: local automation (`download-paper`, build, run, smoke test, RCON helper)
+- `paper/`: local runtime server folder (ignored in git)
 
-## Current Plugin Features
-- Chat echo for `ChatBot` messages.
-- SQLite database in `paper/plugins/VocabularyQuestPlugin/mindcraft.db`.
-- User tracking table updated on join.
-- Vocabulary tables:
-  - `vocab_de_en`
-  - `vocab_de_fr`
-- CSV vocabulary bootstrap on startup from:
-  - `paper/plugins/VocabularyQuestPlugin/vocabulary/de_en.csv`
-  - `paper/plugins/VocabularyQuestPlugin/vocabulary/de_fr.csv`
-- Timed vocabulary quest event:
-  - Random interval: 3 to 10 minutes
-  - Quest timeout: 2 minutes
-  - Weighted vocab selection prefers entries with fewer attempts
-  - Selection is constrained to reward-eligible online players
-  - Correct answer reward: 1 emerald (once per player+vocab)
-- Quest answer input:
-  - `/answer <antwort>`
-  - private message parse: `/msg jenkins <antwort>`
+## Runtime Architecture
+### Plugin
+Main class: `plugin-vocabulary-quest/src/main/java/io/github/stuttgartnerd/vocabularyquest/VocabularyQuestPlugin.java`
 
-## Standard Workflow
+Responsibilities:
+- Track joined users in SQLite
+- Load DE->EN / DE->FR vocab from CSV on startup
+- Schedule vocabulary quests at random intervals (3-10 minutes)
+- Evaluate answers and grant one emerald for first correct answer per player+word
+- Expose RCON-only admin/testing commands
+- Broadcast plugin-originated chat as identity `Jenkins`
+
+### Storage Layer
+Class: `plugin-vocabulary-quest/src/main/java/io/github/stuttgartnerd/vocabularyquest/SQLiteStore.java`
+
+SQLite DB path:
+- `paper/plugins/VocabularyQuestPlugin/mindcraft.db`
+
+Tables:
+- `users`
+- `vocab_de_en`
+- `vocab_de_fr`
+- `player_vocab_rewards`
+- `vocab_attempts`
+
+Quest selection:
+- Only entries reward-eligible for online players are considered
+- Preference is weighted toward lower attempt count
+
+### Chatbot
+Main class: `chat-bot/src/main/java/dev/snpr/chatbot/TestChatBot.java`
+
+Used for:
+- Joining server as `ChatBot`
+- Sending chat/commands
+- Supporting non-interactive mode for smoke tests (`--no-stdin`, `--send-on-connect`, hold window)
+
+## Player/Admin Interface
+### Player-facing
+- `/answer <antwort>`
+- `/msg jenkins <antwort>` (also supports aliases handled in parser)
+- `/questnow` (currently callable in-game/console)
+
+### RCON-only
+- `/dbdump`
+- `/flushanswers`
+- `/addvocab <en|fr> <de_wort> <uebersetzung>`
+
+## Jenkins Chat Identity
+Plugin broadcasts are formatted as:
+- `<Jenkins> ...`
+
+This is used for:
+- Bot echo messages
+- Quest announcement
+- Correct/incorrect result broadcasts
+- Solution reveal and timeout messaging
+
+## Startup/Bootstrap Flow
+1. Ensure Paper exists (`scripts/download-paper.sh 1.21.7`)
+2. Build plugin and bot
+3. Copy plugin jar into `paper/plugins`
+4. Start Paper
+5. Optionally start chatbot
+
+Common commands:
 ```bash
-./scripts/download-paper.sh 1.21.7
-./scripts/gradle.sh :plugin-vocabulary-quest:build :chat-bot:build
+./scripts/gradle.sh :plugin-vocabulary-quest:build :chat-bot:installDist
 ./scripts/copy-plugin.sh
 ./scripts/start-paper.sh
-```
-
-In another terminal:
-```bash
 ./scripts/run-bot.sh --host 127.0.0.1 --port 25565 --username ChatBot
 ```
 
-## Admin and Testing Commands
-- In-game/console:
-  - `/questnow` starts a quest immediately (for fast testing)
-- RCON-only commands:
-  - `/dbdump` dumps users, vocab, rewards, attempts to log
-  - `/flushanswers` clears `player_vocab_rewards` and `vocab_attempts`
-  - `/addvocab <en|fr> <de_wort> <uebersetzung>` inserts vocab row
+## Testing Stages
+### Stage 1: Unit (fast)
+- File: `plugin-vocabulary-quest/src/test/java/io/github/stuttgartnerd/vocabularyquest/SQLiteStoreTest.java`
+- Focus: schema, CRUD, reward/attempt tracking, weighted selection
 
-## RCON Setup
-- `paper/server.properties` must include:
-  - `enable-rcon=true`
-  - `rcon.port=25575`
-  - `rcon.password=<password>`
-- Use RCON for CI/admin-only mutation commands, not player-facing flow.
+### Stage 2: Plugin-level (MockBukkit)
+- File: `plugin-vocabulary-quest/src/test/java/io/github/stuttgartnerd/vocabularyquest/VocabularyQuestPluginMockBukkitTest.java`
+- Focus: command permissions, join event insert, quest+answer flow
 
-## Verify Connection and Message Delivery
-- Paper startup complete when console shows: `Done (... )! For help, type "help"`.
-- Bot connection confirmed by `ChatBot joined the game` in `paper/logs/latest.log`.
-- Chat delivery confirmed by lines like:
-  - `[Not Secure] <ChatBot> your-message`
+### Stage 3: Integration smoke (Paper runtime)
+- Script: `scripts/integration-smoke.sh`
+- Flow: build -> start Paper -> connect bot -> DB dump -> questnow -> bot answer -> DB assert
+- Auto-bootstrap: if `paper/paper.jar` is missing, script calls `download-paper.sh` automatically
 
-Quick check:
+## CI/Automation Commands
 ```bash
-rg -n "ChatBot joined the game|<ChatBot>" paper/logs/latest.log
+./scripts/gradle.sh :plugin-vocabulary-quest:test :plugin-vocabulary-quest:build
+./scripts/integration-smoke.sh
 ```
 
-## Legacy Command Set
-```bash
-./scripts/download-paper.sh 1.21.7
-./scripts/gradle.sh :plugin-vocabulary-quest:build
-./scripts/copy-plugin.sh
-./scripts/start-paper.sh
-MC_HOST=127.0.0.1 MC_PORT=25565 MC_USERNAME=ChatBot ./scripts/gradle.sh :chat-bot:run
-```
+## Local Runtime Notes
+- `paper/` is intentionally git-ignored
+- Smoke test expects RCON enabled and reachable
+- Default RCON values are read from env in `scripts/integration-smoke.sh`
 
-## Test Strategy (Planned)
-1. Unit tests (fast, no Bukkit):
-   - `SQLiteStore` schema/init and CRUD behavior
-   - reward claim idempotency
-   - answer tracking flush
-   - weighted quest selection with online/offline eligibility
-2. Plugin-level tests (MockBukkit):
-   - command access rules (`RCON-only` denied for players/console)
-   - join event user insert
-   - quest start/answer flow
-3. Integration smoke tests (Paper runtime):
-   - startup plugin load
-   - `questnow` path
-   - bot answer path
-   - DB/log assertions
-
-## CI Flow (Target)
-1. PR fast lane:
-   - `./scripts/gradle.sh :plugin-vocabulary-quest:test :plugin-vocabulary-quest:build`
-2. Integration lane (separate job/nightly):
-   - start Paper
-   - run scripted quest + bot scenario
-   - assert log/DB outcomes
-
-## Files of Interest
-- `scripts/download-paper.sh`
-- `scripts/start-paper.sh`
-- `scripts/run-bot.sh`
-- `chat-bot/src/main/java/dev/snpr/chatbot/TestChatBot.java`
+## High-Value Files
 - `plugin-vocabulary-quest/src/main/java/io/github/stuttgartnerd/vocabularyquest/VocabularyQuestPlugin.java`
 - `plugin-vocabulary-quest/src/main/java/io/github/stuttgartnerd/vocabularyquest/SQLiteStore.java`
 - `plugin-vocabulary-quest/src/main/resources/plugin.yml`
-- `paper/logs/latest.log`
+- `chat-bot/src/main/java/dev/snpr/chatbot/TestChatBot.java`
+- `scripts/integration-smoke.sh`
+- `scripts/rcon-command.py`

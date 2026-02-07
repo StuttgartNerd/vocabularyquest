@@ -83,6 +83,23 @@ wait_for_bot_line() {
   return 1
 }
 
+wait_for_player_online() {
+  local timeout_seconds="$1"
+  local waited=0
+
+  while (( waited < timeout_seconds )); do
+    local online_output
+    online_output="$(rcon_cmd "list" 2>/dev/null || true)"
+    if [[ "$online_output" == *"$MC_USERNAME"* ]]; then
+      return 0
+    fi
+    sleep 1
+    ((waited+=1))
+  done
+
+  return 1
+}
+
 start_bot_process() {
   local send_on_connect="${1:-}"
   local send_delay_ms="${2:-0}"
@@ -178,6 +195,60 @@ if [[ "$bot_joined" -ne 1 ]]; then
   exit 1
 fi
 
+wait_for_player_online 30 || {
+  echo "[smoke] Bot did not appear as online player."
+  tail -n 200 "$SERVER_LOG" || true
+  echo "----- bot log -----"
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+}
+
+echo "[smoke] Security abuse check: player-triggered /questnow must be blocked..."
+quest_start_before="$(rg -c "\\[VocabularyQuestPlugin\\] Started quest for" "$SERVER_LOG" || true)"
+stop_bot_process
+sleep 1
+start_bot_process "/questnow" 2500 12
+
+wait_for_bot_line "Connected\\." 25 || {
+  echo "[smoke] Abuse-check bot did not connect."
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+}
+
+wait_for_player_online 30 || {
+  echo "[smoke] Abuse-check bot did not appear online."
+  tail -n 200 "$SERVER_LOG" || true
+  echo "----- bot log -----"
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+}
+
+sleep 3
+quest_start_after="$(rg -c "\\[VocabularyQuestPlugin\\] Started quest for" "$SERVER_LOG" || true)"
+if [[ "$quest_start_after" != "$quest_start_before" ]]; then
+  echo "[smoke] Player-side /questnow unexpectedly started a quest."
+  tail -n 200 "$SERVER_LOG" || true
+  echo "----- bot log -----"
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+fi
+
+stop_bot_process
+sleep 1
+start_bot_process "" 0 240
+wait_for_bot_line "Connected\\." 25 || {
+  echo "[smoke] Bot did not reconnect after abuse check."
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+}
+wait_for_player_online 30 || {
+  echo "[smoke] Bot did not appear online after reconnect."
+  tail -n 200 "$SERVER_LOG" || true
+  echo "----- bot log -----"
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+}
+
 echo "[smoke] Triggering DB dump through RCON..."
 rcon_cmd "dbdump" >/dev/null
 wait_for_log_line "\\[DBDUMP\\] users row: username=${MC_USERNAME}" 30 || {
@@ -234,6 +305,34 @@ if [[ -z "$answer" ]]; then
   echo "[smoke] Could not resolve answer from DB for ${vocab_table}:${de_word}"
   exit 1
 fi
+
+echo "[smoke] Security abuse check: overlong /answer must be rejected..."
+stop_bot_process
+sleep 1
+long_answer="$(printf 'a%.0s' $(seq 1 80))"
+start_bot_process "/answer ${long_answer}" 2500 12
+
+wait_for_bot_line "Connected\\." 25 || {
+  echo "[smoke] Overlong-answer bot did not connect."
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+}
+
+wait_for_player_online 30 || {
+  echo "[smoke] Overlong-answer bot did not appear online."
+  tail -n 200 "$SERVER_LOG" || true
+  echo "----- bot log -----"
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+}
+
+wait_for_bot_line "Antwort ist zu lang" 20 || {
+  echo "[smoke] Expected overlong-answer rejection message not found in bot log."
+  tail -n 200 "$SERVER_LOG" || true
+  echo "----- bot log -----"
+  tail -n 200 "$BOT_LOG" || true
+  exit 1
+}
 
 echo "[smoke] Reconnecting ChatBot to send /answer ..."
 stop_bot_process

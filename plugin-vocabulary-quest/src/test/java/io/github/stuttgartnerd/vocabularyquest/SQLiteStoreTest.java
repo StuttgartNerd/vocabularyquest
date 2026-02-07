@@ -168,4 +168,34 @@ class SQLiteStoreTest {
             assertTrue(baumCount > hausCount, "Expected lower-attempt vocabulary to be selected more often");
         }
     }
+
+    @Test
+    void handlesSqlLikeInputWithoutBreakingSchema() throws Exception {
+        Path db = tempDir.resolve("abuse-input.db");
+
+        String maliciousUsername = "attacker'); DROP TABLE users;--";
+        String maliciousDe = "haus'); DROP TABLE vocab_de_en;--";
+        String maliciousEn = "house'); DELETE FROM users;--";
+
+        try (SQLiteStore store = new SQLiteStore(db)) {
+            store.initializeSchema();
+            store.replaceDeEn(List.of(new SQLiteStore.VocabEntry(maliciousDe, maliciousEn)));
+            store.replaceDeFr(List.of(new SQLiteStore.VocabEntry("haus", "maison")));
+
+            store.upsertUser(maliciousUsername);
+            store.recordAttempt(maliciousUsername, "de_en", maliciousDe, false);
+            assertTrue(store.claimReward(maliciousUsername, "de_en", maliciousDe));
+
+            SQLiteStore.DumpSummary summary = store.dumpToLog(TEST_LOGGER);
+            assertEquals(1, summary.users());
+            assertEquals(1, summary.deEnEntries());
+            assertEquals(1, summary.deFrEntries());
+            assertEquals(1, summary.rewards());
+            assertEquals(1, summary.attempts());
+
+            // If schema is intact, normal writes still work after malicious-like input.
+            store.upsertUser("normal-user");
+            assertEquals(2, store.dumpToLog(TEST_LOGGER).users());
+        }
+    }
 }

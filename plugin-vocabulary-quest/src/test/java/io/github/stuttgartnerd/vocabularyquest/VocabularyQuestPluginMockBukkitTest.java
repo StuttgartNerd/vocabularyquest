@@ -7,6 +7,7 @@ import be.seeseemelk.mockbukkit.entity.PlayerMock;
 import org.bukkit.Material;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.command.RemoteConsoleCommandSender;
+import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -50,11 +51,17 @@ class VocabularyQuestPluginMockBukkitTest {
         CommandResult playerResult = server.executePlayer("flushanswers");
         playerResult.assertResponse("This command is restricted to RCON.");
 
+        CommandResult playerQuestResult = server.executePlayer("questnow");
+        playerQuestResult.assertResponse("This command is restricted to RCON.");
+
         CommandResult consoleDumpResult = server.executeConsole("dbdump");
         consoleDumpResult.assertResponse("This command is restricted to RCON.");
 
         CommandResult consoleResult = server.executeConsole("addvocab", "en", "hund", "dog");
         consoleResult.assertResponse("This command is restricted to RCON.");
+
+        CommandResult consoleQuestResult = server.executeConsole("questnow");
+        consoleQuestResult.assertResponse("This command is restricted to RCON.");
     }
 
     @Test
@@ -86,6 +93,12 @@ class VocabularyQuestPluginMockBukkitTest {
         assertNotNull(flushAnswers);
         assertTrue(plugin.onCommand(rcon, flushAnswers, "flushanswers", new String[0]));
 
+        PluginCommand questNow = server.getPluginCommand("questnow");
+        assertNotNull(questNow);
+        assertTrue(plugin.onCommand(rcon, questNow, "questnow", new String[0]));
+        assertTrue(messages.stream().anyMatch(m -> m.contains("Quest konnte nicht gestartet")
+                || m.contains("Vokabel-Quest wurde gestartet")));
+
         SQLiteStore.DumpSummary afterFlush = store.dumpToLog(java.util.logging.Logger.getLogger("test"));
         assertEquals(0, afterFlush.rewards());
         assertEquals(0, afterFlush.attempts());
@@ -109,9 +122,13 @@ class VocabularyQuestPluginMockBukkitTest {
     void questNowAndAnswerFlowRewardsPlayer() throws Exception {
         String username = "QuestUser_" + UUID.randomUUID().toString().substring(0, 8);
         PlayerMock player = server.addPlayer(username);
+        List<String> rconMessages = new ArrayList<>();
+        RemoteConsoleCommandSender rcon = createRconSender(rconMessages);
 
-        CommandResult questStart = server.executeConsole("questnow");
-        questStart.assertResponse("Vokabel-Quest wurde gestartet.");
+        PluginCommand questNow = server.getPluginCommand("questnow");
+        assertNotNull(questNow);
+        assertTrue(plugin.onCommand(rcon, questNow, "questnow", new String[0]));
+        assertTrue(rconMessages.stream().anyMatch(m -> m.contains("Vokabel-Quest wurde gestartet.")));
 
         Object activeQuest = getActiveQuest();
         assertNotNull(activeQuest);
@@ -127,6 +144,48 @@ class VocabularyQuestPluginMockBukkitTest {
 
         assertNull(getActiveQuest());
         assertEquals(emeraldsBefore + 1, countMaterial(player, Material.EMERALD));
+    }
+
+    @Test
+    void overlongAnswerIsRejectedAndDoesNotRewardPlayer() throws Exception {
+        String username = "LengthUser_" + UUID.randomUUID().toString().substring(0, 8);
+        PlayerMock player = server.addPlayer(username);
+        List<String> rconMessages = new ArrayList<>();
+        RemoteConsoleCommandSender rcon = createRconSender(rconMessages);
+
+        PluginCommand questNow = server.getPluginCommand("questnow");
+        assertNotNull(questNow);
+        assertTrue(plugin.onCommand(rcon, questNow, "questnow", new String[0]));
+        assertNotNull(getActiveQuest());
+
+        int emeraldsBefore = countMaterial(player, Material.EMERALD);
+        server.execute("answer", player, "a".repeat(80));
+
+        assertTrue(playerReceivedMessageContaining(player, "Antwort ist zu lang (max 64 Zeichen)."));
+        assertNotNull(getActiveQuest());
+        assertEquals(emeraldsBefore, countMaterial(player, Material.EMERALD));
+    }
+
+    @Test
+    void privateMessageOldAliasIsIgnored() {
+        PlayerMock player = server.addPlayer("AliasUser");
+        PlayerCommandPreprocessEvent event = new PlayerCommandPreprocessEvent(player, "/msg plugin haus");
+
+        plugin.onPrivateMessageCommand(event);
+
+        assertFalse(event.isCancelled());
+    }
+
+    @Test
+    void addVocabRejectsOverlongTerms() {
+        List<String> rconMessages = new ArrayList<>();
+        RemoteConsoleCommandSender rcon = createRconSender(rconMessages);
+        PluginCommand addVocab = server.getPluginCommand("addvocab");
+        assertNotNull(addVocab);
+
+        String longWord = "x".repeat(65);
+        assertTrue(plugin.onCommand(rcon, addVocab, "addvocab", new String[]{"en", longWord, "house"}));
+        assertTrue(rconMessages.stream().anyMatch(m -> m.contains("Vocabulary terms must be <= 64 characters.")));
     }
 
     private RemoteConsoleCommandSender createRconSender(List<String> sink) {
@@ -195,6 +254,19 @@ class VocabularyQuestPluginMockBukkitTest {
                 .stream()
                 .mapToInt(stack -> stack.getAmount())
                 .sum();
+    }
+
+    private boolean playerReceivedMessageContaining(PlayerMock player, String expectedText) {
+        for (int i = 0; i < 30; i++) {
+            String message = player.nextMessage();
+            if (message == null) {
+                break;
+            }
+            if (message.contains(expectedText)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private Object defaultValue(Class<?> returnType) {
